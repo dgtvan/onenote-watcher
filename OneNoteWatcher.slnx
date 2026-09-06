@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/OneNoteWatcher.Collector/OneNoteWatcher.Collector.csproj" />
+    <Project Path="src/OneNoteWatcher.Core/OneNoteWatcher.Core.csproj" />
+    <Project Path="src/OneNoteWatcher/OneNoteWatcher.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/OneNoteWatcher.Collector.Tests/OneNoteWatcher.Collector.Tests.csproj" />
+    <Project Path="tests/OneNoteWatcher.Core.Tests/OneNoteWatcher.Core.Tests.csproj" />
+  </Folder>
+</Solution>

@@ -1,0 +1,14 @@
+## .NET build output
+bin/
+obj/
+*.user
+
+## Scratch / captures (never commit telemetry captures — may contain personal data)
+*.etl
+*.etl.csv
+*.etl.summary.txt
+onwatch*.etl
+
+## OS
+Thumbs.db
+.DS_Store
