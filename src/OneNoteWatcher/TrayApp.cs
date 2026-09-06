@@ -13,8 +13,8 @@ namespace OneNoteWatcher;
 /// The unelevated tray app. The icon ALWAYS reflects the last known state — whether or not OneNote is
 /// running — from the collector's status.json plus local detectors (OAlerts dialogs, Graph outcome
 /// baseline, health checks). TWO STATES ONLY:
-///   red pulsing = ERROR — something is wrong and you need to look (where/why/fix in the balloon and window)
-///   green       = SUCCESS — everything the watcher can check is healthy
+///   red cloud, pulsing = ERROR — something is wrong and you need to look (where/why/fix in the balloon and window)
+///   white-outlined cloud = SUCCESS — everything the watcher can check is healthy
 /// There is no middle "warning" tier, because that is the tier people learn to ignore. Noise is
 /// controlled explicitly instead, through [ignore] rules, the [transient] policy, and TTLs.
 /// Menu is deliberately minimal: Show issues &amp; status / Check now / Open config.ini / Quit.

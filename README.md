@@ -32,8 +32,8 @@ Everything lives in one folder, `C:\ProgramData\OneNoteWatcher`: both executable
 
 | Icon | Meaning |
 |---|---|
-| **red, pulsing** | **ERROR** — something is wrong and you need to look |
-| green | **SUCCESS** — everything the watcher can check is healthy |
+| **red cloud, pulsing** | **ERROR** — something is wrong and you need to look |
+| white-outlined cloud | **SUCCESS** — everything the watcher can check is healthy |
 
 There is no middle "warning" tier, because that is the tier people learn to ignore. Anything the
 watcher cannot verify counts as an error — **including its own blindness** (collector down, Microsoft
@@ -77,3 +77,10 @@ OneNoteWatcher.exe --graph-check                              # local index vs M
 | [testing.md](docs/testing.md) | How to provoke real sync failures and watch the app react |
 | [requirements.md](docs/requirements.md) | Every stated requirement and an honest verdict |
 | [experiments/](experiments/) | The read-only probes behind the measurements |
+
+## Credits
+
+Tray icon: [Cloud icon](https://www.flaticon.com/free-icon/cloud_2311548?related_id=2311548) by
+[Flaticon](https://www.flaticon.com/), used under the Flaticon Free License with attribution. The app
+recolours it at runtime (white outline for success, red for error) — see
+[TrayIcons.cs](src/OneNoteWatcher/TrayIcons.cs).
