@@ -294,9 +294,15 @@ The rule that does remove it:
 
 Deliberately narrow, so it cannot hide a real problem:
 
-- **Only a full `SectionSyncResult` success counts.** A page upload, a real-time round trip, or a
-  notebook-level success is not recorded as a section result and suppresses nothing. (Notebook success
-  in particular is not evidence — see the coverage table above.)
+- **Only successful, section-scoped activity counts** — a section sync, a real-time session, or a page
+  transfer that reported success. A failure never counts, and a notebook-level success is not
+  section-scoped so it suppresses nothing (see the coverage table above).
+
+  This started out as "full section sync only", which was wrong: **measured 2026-09-06, a section went
+  more than four hours with healthy real-time and notebook activity and produced no `SectionSyncResult`
+  at all.** OneNote emits one when a section has changes to reconcile, not on every sync — so requiring
+  one made the question unanswerable and left the false alert standing the whole time. The question
+  being asked is only "why did the local stamp move?", and any healthy activity answers it.
 - The success must be **at or after** the local timestamp. An earlier sync proves nothing about a later
   change.
 - Sections are matched on a **canonical key** (`SectionKey`), because the same section appears as
@@ -313,6 +319,86 @@ notebook names disagreed — which they routinely do, since the local index repo
 nickname ("Van") and Graph by its real name ("Note"). OneNote creates a *Quick Notes* in every
 notebook, so that fallback could compare two unrelated sections. It now requires the name to be
 unique.
+
+## An inference that cannot be disproved must not stand forever
+
+The rule above — believe the collector over the timestamps — is right, but on its own it was not
+enough, and the alert survived two rounds of fixes. The reason is worth stating plainly:
+
+> **"Local newer than the server copy" can be permanently true, and permanently wrong.**
+
+OneNote re-stamps the local index whenever it reconciles a section, *including reconciliations that
+change nothing on the server*. In exactly that case the server timestamp will never advance either. So
+the section enters a state that is indistinguishable from a stranded change and has no exit: no future
+event can disprove it, and the alert stands until someone edits that section again. Measured
+2026-09-06: Quick Notes sat "not reaching OneDrive" for 4.3 hours and climbing, while OneNote reported
+both notebooks up to date and a manual **Sync All** found nothing to send.
+
+Waiting for corroboration does not help when corroboration may never arrive. So an uncorroborated claim
+is now **abandoned** after `unconfirmed_minutes` (default 120), and the section is re-baselined.
+
+The safety conditions are what keep this fail-closed. Giving up is allowed only while a genuine failure
+*would have been seen*:
+
+| Condition at give-up time | Why it is required |
+|---|---|
+| The collector is fresh and reporting | Without it a real upload failure would go unseen, so silence is not evidence of health |
+| OneNote is running | It has had the chance to sync and to report an error, and did neither |
+| No corroboration for the full window | OneNote retries uploads continuously; hours of silence from it is itself informative |
+
+With OneNote closed, or the collector down, the claim stands indefinitely — which is precisely the
+"edited, then shut down" case this check exists to catch. Setting `unconfirmed_minutes = 0` disables
+the give-up entirely. Every abandonment is logged with its reason.
+
+This is a deliberate trade. The alternative — an alert that cannot be cleared by any action the user
+can take — trains the user to ignore a red icon, which loses the rare real failure far more reliably
+than a bounded inference does.
+
+## Elapsed time must exclude time the machine was asleep
+
+**Measured 2026-09-06.** The laptop slept for three hours. On resume the watcher raised two alerts at
+once, neither describing anything wrong:
+
+- *"OneNote is running but the watcher has received no Office telemetry at all for 3.0 h"*
+- *"The Microsoft Graph check is not running (last successful check 16:26)"*
+
+Both are "nothing has happened for N minutes" checks, and both subtracted wall-clock timestamps. But
+the question they exist to ask is *"have I been watching for N minutes and seen nothing?"*, and a
+suspended machine produces a gap nobody was awake to observe.
+
+Every such check now measures in **awake time**, via the OS counter `QueryUnbiasedInterruptTime`, which
+stops while the system is suspended. The value used is the smaller of the wall-clock gap and the awake
+gap, so it can only ever under-report: a sleep cannot manufacture an alarm, and a genuine stall is
+still reported in full. The tray also re-checks the cloud side immediately on resume, instead of
+waiting out a poll interval with a stale picture.
+
+This is the third false alarm of exactly this shape — the first counted time before the collector
+started, the second used an unmeasured threshold. **Any duration this app reports must be time it was
+actually watching.**
+
+## A stale poll is not an authentication problem
+
+The same resume produced *"The Microsoft Graph check is not running… click 'Sign in to Graph…'"* while
+the user was signed in and the sign-in button was not even on screen. One issue type was doing three
+jobs: not signed in, sign-in expired, and poll not running. Only the first two are authentication.
+
+A stalled poll is now its own issue: `SourceUnavailable`, no permission category, and an action the
+user can actually take (**Check now** on the tray menu). `GraphTokenExpired` keeps the sign-in advice,
+because there the button really is shown.
+
+## The tray crashed while it was reporting a problem
+
+`Bitmap.GetHicon()` returns a native icon handle that `Icon.FromHandle` does **not** take ownership of,
+so disposing the managed `Icon` leaked the handle. The error state pulses twice a second, so the leak
+only ran while the tray was red.
+
+Measured on the live process: **7,520 GDI objects and climbing about 7 per second**, against a
+per-process limit of 10,000. That is a hard crash roughly an hour into any error state, and the log
+showed exactly that — a burst of `A generic error occurred in GDI+`, a failed refresh, then a restart.
+The watcher was reliably dying at the moment it had something to report.
+
+The four icons the app uses are now rendered once and shared, and the native handle is destroyed after
+cloning into a managed icon that owns its own.
 
 ## Gaps found and fixed by this review
 

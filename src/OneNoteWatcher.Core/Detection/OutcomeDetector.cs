@@ -33,7 +33,25 @@ public sealed class OutcomeDetector
     /// <see cref="CloudConfirmedAfter"/>.</summary>
     private readonly Dictionary<string, DateTimeOffset> _cloudConfirmed = new(StringComparer.OrdinalIgnoreCase);
 
-    public OutcomeDetector(TimeSpan grace) => _grace = grace;
+    private readonly TimeSpan _unconfirmedTtl;
+
+    /// <param name="unconfirmedTtl">How long an UNCORROBORATED "not reaching OneDrive" claim may stand
+    /// before it is abandoned — see the give-up rule in <see cref="Evaluate(IReadOnlyList{LocalSection},
+    /// GraphSnapshot, bool, bool?, DateTimeOffset?, IReadOnlyList{SectionSyncState}?)"/>.</param>
+    public OutcomeDetector(TimeSpan grace, TimeSpan? unconfirmedTtl = null)
+    {
+        _grace = grace;
+        // not specified -> the two-hour default; explicitly zero or negative -> never give up
+        _unconfirmedTtl = unconfirmedTtl switch
+        {
+            null => TimeSpan.FromHours(2),
+            { } t when t <= TimeSpan.Zero => TimeSpan.MaxValue,
+            { } t => t,
+        };
+    }
+
+    /// <summary>Sections abandoned during the last <c>Evaluate</c>, with the reason — for the log.</summary>
+    public IReadOnlyList<string> LastAbandoned { get; private set; } = [];
 
     public int BaselinedSections => _baseline.Count;
 
@@ -54,6 +72,7 @@ public sealed class OutcomeDetector
     {
         var at = now ?? DateTimeOffset.UtcNow;
         var issues = new List<SyncIssue>();
+        var abandoned = new List<string>();
 
         foreach (var gs in server.Sections)
         {
@@ -80,11 +99,11 @@ public sealed class OutcomeDetector
             var serverMoved = serverNewest > (b.server ?? DateTimeOffset.MinValue);
             var serverCaughtUp = serverNewest >= localNewest - SyncTolerance;
 
-            // OneNote completed a full sync of this section at or after the local timestamp. That is a
-            // direct statement that the section is in step with the server, so nothing here is stranded —
-            // and it outranks both inputs this class infers from, each of which is known to mislead:
-            // Graph's lastModifiedDateTime can lag, and the local index re-stamps a section that was
-            // merely re-synced, which makes a plain re-sync look like an edit that never went up.
+            // The collector saw this section sync healthily at the moment its local timestamp moved, so
+            // the movement is a sync re-stamp, not an unsent edit. That outranks both inputs this class
+            // infers from, each of which is known to mislead: Graph's lastModifiedDateTime can lag, and
+            // the local index re-stamps a section on ANY reconciliation — including one that changes
+            // nothing on the server, which is precisely when the server timestamp will not move either.
             var collectorSynced = SectionSyncedAt(collectorSections, gs.Id, localNewest);
 
             // OneDrive is not behind this PC for this section: its content is safely on the server as of
@@ -105,6 +124,31 @@ public sealed class OutcomeDetector
             if (localMoved && !serverCaughtUp && !collectorSynced)
             {
                 if (!_aheadSince.TryGetValue(key, out var since)) { _aheadSince[key] = since = at; }
+
+                // GIVE UP on a claim we have failed to corroborate.
+                //
+                // This comparison can be permanently wrong and never falsifiable. The local index is
+                // re-stamped whenever a section is reconciled, including reconciliations that change
+                // nothing on the server — and in exactly that case the server timestamp will never
+                // advance either, so "local ahead" becomes a state with no way out. Measured 2026-09-06:
+                // Quick Notes sat "unsynced" for 4.3 h while OneNote reported the notebook up to date.
+                //
+                // Abandoning it is only safe while we would have SEEN a genuine failure, so it requires
+                // both: the collector fresh enough to be reporting (collectorSections non-null) and
+                // OneNote running, i.e. it has had the chance to sync and to report an error and did
+                // neither. With OneNote closed, or the collector down, the claim stands indefinitely —
+                // which is the "edited, then shut down" case this check exists for.
+                if (_unconfirmedTtl != TimeSpan.MaxValue
+                    && collectorSections is not null && oneNoteRunning && at - since >= _unconfirmedTtl)
+                {
+                    _baseline[key] = (localNewest, serverNewest);
+                    _aheadSince.Remove(key);
+                    abandoned.Add($"{gs.NotebookName} / {gs.DisplayName}: no corroboration after " +
+                                  $"{Human(at - since)} with OneNote running and the collector reporting — " +
+                                  "treating the local timestamp as a sync re-stamp, not an unsent change");
+                    continue;
+                }
+
                 if (at - since >= _grace)
                 {
                     var ex = ErrorCatalog.UploadStuck(oneNoteRunning, internet);
@@ -141,19 +185,26 @@ public sealed class OutcomeDetector
             }
             if (!localMoved) _baseline[key] = (b.local, serverNewest); // keep server side current
         }
+        LastAbandoned = abandoned;
         return issues;
     }
 
-    /// <summary>True when the collector saw OneNote finish a full sync of this section at or after
-    /// <paramref name="at"/>. False whenever the collector is not running or the section is unmatched —
-    /// an absent result is never taken as reassurance.</summary>
+    /// <summary>
+    /// True when the collector saw healthy sync activity for this section at (or just before)
+    /// <paramref name="at"/> — i.e. the local timestamp moving to that moment is explained by a sync
+    /// rather than by an unsent edit. The small tolerance exists because the index stamp and the
+    /// telemetry timestamp are written by different code paths a second or so apart.
+    ///
+    /// False whenever the collector is not running or the section is unmatched: an absent result is
+    /// never taken as reassurance.
+    /// </summary>
     private static bool SectionSyncedAt(IReadOnlyList<SectionSyncState>? sections, string? graphSectionId, DateTimeOffset at)
     {
         if (sections is null || sections.Count == 0) return false;
         var key = SectionKey.Normalize(graphSectionId);
         if (key is null) return false;
         var hit = sections.FirstOrDefault(x => x.Key == key);
-        return hit is not null && hit.LastSuccessUtc >= at;
+        return hit is not null && hit.LastHealthySyncUtc >= at - SyncTolerance;
     }
 
     /// <summary>

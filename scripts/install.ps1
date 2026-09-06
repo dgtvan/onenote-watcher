@@ -1,16 +1,18 @@
 # OneNote Sync Watcher — single-script INSTALL / UPDATE. Run as Administrator.
 #
-#   & "D:\Src\Personal\onenote-watcher\scripts\install.ps1"              # full install (first time)
-#   & "D:\Src\Personal\onenote-watcher\scripts\install.ps1" -UpdateOnly  # after code changes: rebuild, swap binaries, restart
+#   & "D:\Src\Personal\onenote-watcher\scripts\install.ps1"              # full install — REPLACES config.ini
+#   & "D:\Src\Personal\onenote-watcher\scripts\install.ps1" -UpdateOnly  # rebuild + swap binaries, KEEPS config.ini
 #
 # ONE root folder holds everything: executables, config.ini, status.json, section-names.json and logs\.
 # Default root: C:\ProgramData\OneNoteWatcher (both the SYSTEM collector and the user's tray can write there;
 # Program Files cannot be written by the unelevated tray, which is why it is not used).
 #
-# Full install: builds Release, copies binaries, keeps an existing config.ini, grants Users modify on the
-# root, registers two Scheduled Tasks (collector as SYSTEM at startup; tray at your logon), starts both.
-# -UpdateOnly: everything except the task registration/ACL — needed whenever the INSTALLED binaries must
-# change, because the tasks run the copies in the root folder, not your build output.
+# Full install: builds Release, copies binaries, REPLACES config.ini with the repo's copy (the previous
+# one is saved next to it as config.ini.bak-<timestamp>), grants Users modify on the root, registers two
+# Scheduled Tasks (collector as SYSTEM at startup; tray at your logon), starts both.
+# -UpdateOnly: everything except the task registration/ACL, and it KEEPS your config.ini — needed
+# whenever the INSTALLED binaries must change, because the tasks run the copies in the root folder, not
+# your build output. Use it when you have settings you want to preserve.
 param(
     [string]$InstallDir = "C:\ProgramData\OneNoteWatcher",
     [string]$TrayUser   = "",     # default: the logged-on console user (works when elevated under another account)
@@ -41,12 +43,32 @@ Get-ScheduledTask -TaskName $CollectorTask, $TrayTask -ErrorAction SilentlyConti
 Get-Process OneNoteWatcher, OneNoteWatcher.Collector -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Start-Sleep 1
 
-# copy binaries into the root; keep config.ini, status, logs
+# copy binaries into the root; status.json, section-names.json and logs\ are always preserved
 New-Item -ItemType Directory -Force -Path $InstallDir, (Join-Path $InstallDir "logs") | Out-Null
 $cfg = Join-Path $InstallDir "config.ini"
 Copy-Item "$trayBin\*" $InstallDir -Recurse -Force -Exclude "config.ini"
 Copy-Item "$colBin\*"  $InstallDir -Recurse -Force -Exclude "config.ini"
-if (-not (Test-Path $cfg)) { Copy-Item "$repo\config.ini" $cfg -Force; Write-Host "Installed config.ini" } else { Write-Host "Kept existing config.ini" }
+# Config policy: a FULL install always installs the repo's config.ini, so a reinstall is a clean,
+# predictable state and newly added settings actually arrive. The old file is kept alongside it rather
+# than discarded, because it may hold [ignore] rules that took real effort to work out.
+# -UpdateOnly is the "keep my settings" path: it never touches config.ini except to create a missing one.
+if ($UpdateOnly) {
+    if (Test-Path $cfg) {
+        Write-Host "Kept existing config.ini"
+    } else {
+        Copy-Item "$repo\config.ini" $cfg -Force
+        Write-Host "Installed config.ini (none was present)"
+    }
+} else {
+    if (Test-Path $cfg) {
+        $backup = "$cfg.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+        Copy-Item $cfg $backup -Force
+        Write-Host "Replaced config.ini  (previous settings saved as $(Split-Path $backup -Leaf))"
+    } else {
+        Write-Host "Installed config.ini"
+    }
+    Copy-Item "$repo\config.ini" $cfg -Force
+}
 # migrate an old Program Files install / old flat log files
 $old = "$env:ProgramFiles\OneNoteWatcher"
 if (Test-Path $old) { Remove-Item $old -Recurse -Force -ErrorAction SilentlyContinue; Write-Host "Removed old install at $old" }

@@ -1,3 +1,4 @@
+using OneNoteWatcher.Core;
 using OneNoteWatcher.Core.Detection;
 using OneNoteWatcher.Core.Graph;
 using OneNoteWatcher.Core.Index;
@@ -24,6 +25,13 @@ public sealed class GraphPoller
 
     public GraphSnapshot? LastSnapshot { get; private set; }
     public DateTimeOffset? LastFetchUtc { get; private set; }
+    /// <summary>Awake-time stamp of the last successful fetch, so a sleeping machine is not mistaken for
+    /// a stalled poller (see <see cref="AwakeClock"/>).</summary>
+    public TimeSpan LastFetchAwake { get; private set; } = AwakeClock.Stamp();
+
+    /// <summary>Running time since the last successful fetch, excluding time the machine was asleep.</summary>
+    public TimeSpan SinceLastFetch =>
+        LastFetchUtc is { } f ? AwakeClock.Elapsed(f, DateTimeOffset.UtcNow, LastFetchAwake) : TimeSpan.MaxValue;
     public string? LastError { get; private set; }
     public bool SignedIn { get; private set; }
 
@@ -34,14 +42,14 @@ public sealed class GraphPoller
     /// </summary>
     public bool CloudConfirmedAfter(string? notebook, string? section, DateTimeOffset t) =>
         SignedIn && LastError is null
-        && LastFetchUtc is { } f && DateTimeOffset.UtcNow - f < TimeSpan.FromMinutes(30)
+        && SinceLastFetch < TimeSpan.FromMinutes(30)
         && _outcome.CloudConfirmedAfter(notebook, section, t);
 
-    public GraphPoller(GraphAuth auth, TimeSpan grace, string sharedDir, AppLog? log = null)
+    public GraphPoller(GraphAuth auth, TimeSpan grace, string sharedDir, AppLog? log = null, TimeSpan? unconfirmedTtl = null)
     {
         _auth = auth; _log = log;
         _client = new GraphClient(async ct => await _auth.TryGetTokenSilentAsync(ct) ?? throw new InvalidOperationException("not signed in"));
-        _outcome = new OutcomeDetector(grace);
+        _outcome = new OutcomeDetector(grace, unconfirmedTtl);
         _sectionMapPath = Path.Combine(sharedDir, "section-names.json");
         _statePath = Path.Combine(sharedDir, "outcome-state.json");
         var restored = _outcome.LoadState(_statePath);
@@ -60,7 +68,7 @@ public sealed class GraphPoller
         try
         {
             LastSnapshot = await _client.FetchAsync(ct);
-            LastFetchUtc = DateTimeOffset.UtcNow; LastError = null;
+            LastFetchUtc = DateTimeOffset.UtcNow; LastFetchAwake = AwakeClock.Stamp(); LastError = null;
             var map = SectionNameMap.FromSnapshot(LastSnapshot);
             map.Save(_sectionMapPath);
             _index.RefreshIfStale(TimeSpan.FromMinutes(1));
@@ -68,6 +76,7 @@ public sealed class GraphPoller
             _outcome.SaveState(_statePath);   // survives tray restart / reboot
             _log?.Info($"graph poll: {LastSnapshot.Notebooks.Count} notebooks, {LastSnapshot.Sections.Count} sections, map keys={map.Count}, baselined={_outcome.BaselinedSections}, collector sections={collectorSections?.Count ?? 0}, outcome issues={issues.Count}");
             foreach (var i in issues) _log?.Warn($"outcome issue {i.Location}: {i.Message}");
+            foreach (var a in _outcome.LastAbandoned) _log?.Info($"cloud check gave up on {a}");
             return issues;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or InvalidOperationException)

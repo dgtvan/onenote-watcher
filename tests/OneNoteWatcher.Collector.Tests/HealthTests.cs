@@ -14,6 +14,9 @@ public class HealthTests : IDisposable
 {
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "onwatch_health_" + Guid.NewGuid().ToString("N"));
 
+    /// <summary>Simulated awake time, advanced by tests in step with their simulated wall clock.</summary>
+    private TimeSpan _awake = TimeSpan.Zero;
+
     private EtwSyncDetector NewDetector(bool oneNoteRunning, string? indexDir = null)
     {
         var names = new NameResolver(
@@ -21,7 +24,7 @@ public class HealthTests : IDisposable
             new MruReader(Path.Combine(_dir, "nomru")));
         names.Refresh(TimeSpan.Zero);
         return new EtwSyncDetector(new NullSource(), new SyncHistoryLog(_dir), names,
-            oneNoteRunning: () => oneNoteRunning);
+            oneNoteRunning: () => oneNoteRunning, awakeClock: () => _awake);
     }
 
     private static OfficeLogMessage Msg(string json) =>
@@ -39,7 +42,8 @@ public class HealthTests : IDisposable
         det.EvaluateHealth(TimeSpan.FromMinutes(45));         // fresh → nothing wrong
         Assert.DoesNotContain(det.ActiveIssues(), i => i.Message.Contains("no telemetry"));
 
-        // pretend the pipeline went silent for hours
+        // pretend the pipeline went silent for hours WHILE THE MACHINE WAS AWAKE
+        _awake += TimeSpan.FromHours(3);
         det.EvaluateHealth(TimeSpan.FromMinutes(45), DateTimeOffset.UtcNow.AddHours(3));
         var dead = Assert.Single(det.ActiveIssues(), i => i.Message.Contains("no telemetry"));
         Assert.Contains("pipeline", dead.Summary);
@@ -87,11 +91,26 @@ public class HealthTests : IDisposable
     public void Watchdog_clears_once_telemetry_resumes()
     {
         var det = NewDetector(oneNoteRunning: true);
+        _awake += TimeSpan.FromMinutes(30);
         det.EvaluateHealth(TimeSpan.FromMinutes(1), DateTimeOffset.UtcNow.AddMinutes(30));
         Assert.Contains(det.ActiveIssues(), i => i.Message.Contains("no telemetry"));
 
         det.OnMessage(Msg(NotebookOk));
         det.EvaluateHealth(TimeSpan.FromMinutes(45));
+        Assert.DoesNotContain(det.ActiveIssues(), i => i.Message.Contains("no telemetry"));
+    }
+
+    [Fact]
+    public void Time_the_machine_spent_ASLEEP_is_not_reported_as_silence()
+    {
+        // 2026-09-06: a 3 h sleep raised "no Office telemetry at all for 3.0 h". Nothing was wrong —
+        // the watcher simply was not running to observe those hours.
+        var det = NewDetector(oneNoteRunning: true);
+        det.OnMessage(Msg(NotebookOk));
+
+        // wall clock jumps three hours; awake time does not advance at all
+        det.EvaluateHealth(TimeSpan.FromMinutes(45), DateTimeOffset.UtcNow.AddHours(3));
+
         Assert.DoesNotContain(det.ActiveIssues(), i => i.Message.Contains("no telemetry"));
     }
 
@@ -162,6 +181,7 @@ public class HealthTests : IDisposable
         var det = NewDetector(oneNoteRunning: true);
         var statusPath = Path.Combine(_dir, "status.json");
 
+        _awake += TimeSpan.FromHours(3);   // three hours of RUNNING time, not three hours of sleep
         det.EvaluateHealth(TimeSpan.FromMinutes(60), DateTimeOffset.UtcNow.AddHours(3));
         det.Snapshot().Save(statusPath);
 

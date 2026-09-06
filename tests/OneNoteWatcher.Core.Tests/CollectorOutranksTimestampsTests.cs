@@ -93,7 +93,7 @@ public class CollectorOutranksTimestampsTests
     }
 
     [Fact]
-    public void A_section_sync_BEFORE_the_local_change_proves_nothing()
+    public void A_sync_well_before_the_local_change_proves_nothing()
     {
         Assert.Single(AfterGrace(Baselined(), Collector(_localStamp.AddMinutes(-5))));
     }
@@ -133,5 +133,73 @@ public class CollectorOutranksTimestampsTests
         var issues = d.Evaluate(two, Server(_serverStale), true, true, _localStamp.AddMinutes(22));
 
         Assert.Empty(issues);   // ambiguous → no comparison, rather than a comparison against the wrong section
+    }
+
+    // ---- giving up on a claim that can never be disproved ----
+
+    /// <summary>Minutes of simulated polling elapsed, so successive calls never move the clock backwards.</summary>
+    private double _elapsed;
+    /// <summary>Everything the detector abandoned across the whole run — LastAbandoned covers one poll only.</summary>
+    private readonly List<string> _abandoned = [];
+
+    /// <summary>Keep polling every 5 minutes for a further <paramref name="hours"/>, returning the last result.</summary>
+    private IReadOnlyList<SyncIssue> PollFor(OutcomeDetector d, double hours, bool collectorUp, bool oneNoteRunning)
+    {
+        IReadOnlyList<SectionSyncState>? sections = collectorUp ? [] : null;
+        IReadOnlyList<SyncIssue> last = [];
+        var until = _elapsed + hours * 60;
+        for (; _elapsed <= until; _elapsed += 5)
+        {
+            last = d.Evaluate(Local(_localStamp), Server(_serverStale), oneNoteRunning, true,
+                _localStamp.AddMinutes(_elapsed), sections);
+            _abandoned.AddRange(d.LastAbandoned);
+        }
+        return last;
+    }
+
+    [Fact]
+    public void An_uncorroborated_claim_is_abandoned_once_OneNote_and_the_collector_have_stayed_healthy()
+    {
+        var d = Baselined();
+        Assert.NotEmpty(PollFor(d, 1, collectorUp: true, oneNoteRunning: true));    // still standing at 1 h
+
+        var after = PollFor(d, 3, collectorUp: true, oneNoteRunning: true);         // past the 2 h default
+
+        Assert.Empty(after);
+    }
+
+    [Fact]
+    public void It_says_why_it_gave_up()
+    {
+        var d = Baselined();
+        PollFor(d, 3, collectorUp: true, oneNoteRunning: true);
+
+        var note = Assert.Single(_abandoned);
+        Assert.Contains("Quick Notes", note);
+        Assert.Contains("no corroboration", note);
+    }
+
+    [Fact]
+    public void It_never_gives_up_while_OneNote_is_closed()
+    {
+        // "edited, then closed OneNote" is exactly what this check exists to catch — it must not expire
+        var d = Baselined();
+        Assert.NotEmpty(PollFor(d, 6, collectorUp: true, oneNoteRunning: false));
+    }
+
+    [Fact]
+    public void It_never_gives_up_while_the_collector_is_down()
+    {
+        // without the collector a real failure would go unseen, so silence is not evidence of health
+        var d = Baselined();
+        Assert.NotEmpty(PollFor(d, 6, collectorUp: false, oneNoteRunning: true));
+    }
+
+    [Fact]
+    public void The_give_up_rule_can_be_switched_off()
+    {
+        var d = new OutcomeDetector(TimeSpan.FromMinutes(10), TimeSpan.Zero);
+        d.Evaluate(Local(_t0), Server(_serverStale), true, true, _t0);
+        Assert.NotEmpty(PollFor(d, 12, collectorUp: true, oneNoteRunning: true));
     }
 }

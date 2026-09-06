@@ -1,5 +1,6 @@
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Runtime.InteropServices;
 
 namespace OneNoteWatcher;
 
@@ -14,7 +15,28 @@ public static class TrayIcons
 
     private static readonly Color Purple = Color.FromArgb(0x80, 0x39, 0x7B); // OneNote purple
 
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool DestroyIcon(IntPtr handle);
+
+    // There are only four icons in the whole app, and the error state repaints twice a second, so they
+    // are built once and shared. Callers must NOT dispose them.
+    private static readonly Dictionary<(State, bool), Icon> Cache = new();
+    private static readonly object Gate = new();
+
+    /// <summary>The icon for this state. Cached and shared — do not dispose the result.</summary>
     public static Icon Make(State state, bool pulseBright = false)
+    {
+        lock (Gate)
+        {
+            if (Cache.TryGetValue((state, pulseBright), out var cached)) return cached;
+            var icon = Render(state, pulseBright);
+            Cache[(state, pulseBright)] = icon;
+            return icon;
+        }
+    }
+
+    private static Icon Render(State state, bool pulseBright)
     {
         using var bmp = new Bitmap(32, 32);
         using (var g = Graphics.FromImage(bmp))
@@ -40,7 +62,18 @@ public static class TrayIcons
             using (var db = new SolidBrush(dot))
                 g.FillEllipse(db, cx - r / 2, cy - r / 2, r, r);
         }
-        return Icon.FromHandle(bmp.GetHicon());
+        // Bitmap.GetHicon returns a native handle that Icon.FromHandle does NOT take ownership of, so
+        // disposing that Icon leaks the HICON. Left unfixed the pulsing error icon exhausted the
+        // process GDI quota in about an hour and the tray died with "A generic error occurred in GDI+"
+        // — it crashed precisely while it was reporting a problem. Clone into a managed icon that owns
+        // its own handle, then destroy the native one.
+        var h = bmp.GetHicon();
+        try
+        {
+            using var borrowed = Icon.FromHandle(h);
+            return (Icon)borrowed.Clone();
+        }
+        finally { DestroyIcon(h); }
     }
 
     private static GraphicsPath Rounded(Rectangle r, int radius)
