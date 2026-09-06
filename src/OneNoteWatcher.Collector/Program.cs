@@ -86,6 +86,9 @@ var detector = new EtwSyncDetector(source, history, names, log: log,
     transient: OneNoteWatcher.Core.Rules.TransientPolicy.FromConfig(ini));
 if (liveSource is not null) liveSource.OnEventsLost = detector.ReportEventsLost;
 
+var seeded = detector.SeedSectionSuccesses(WatcherStatus.Load(statusPath)?.Sections);
+if (seeded > 0) log.Info($"restored {seeded} section sync result(s) from the previous run");
+
 var backfiller = new DiagLogBackfill(sharedDir, Path.Combine(localAppData, @"Temp\Diagnostics\ONENOTE"));
 if (backfill)
 {

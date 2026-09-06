@@ -81,6 +81,55 @@ public class NotebookTableTests : IDisposable
         Assert.Equal(notebooksWithIssues, failedNotebooks);
     }
 
+    // ---- per-section results published for the cloud check ----
+
+    [Fact]
+    public void A_completed_section_sync_is_published_under_its_canonical_key()
+    {
+        var det = NewDetector();
+        det.OnMessage(Msg(SectionOk("2026-09-06T08:28:45Z")));
+
+        var pub = Assert.Single(det.Snapshot().Sections);
+        Assert.Equal(OneNoteWatcher.Core.Model.SectionKey.Normalize(Sec), pub.Key);
+        Assert.Equal(new DateTimeOffset(2026, 9, 6, 8, 28, 45, TimeSpan.Zero), pub.LastSuccessUtc);
+    }
+
+    [Fact]
+    public void Weaker_successes_are_not_published_as_a_section_sync()
+    {
+        var det = NewDetector();
+        // a page upload and a real-time round trip move content but do not assert the section is in step
+        det.OnMessage(Msg($$"""{"EventName":"Office.OneNote.Storage.RealTime.NoteItHttpUpload","Time":"2026-09-06T08:28:45Z","Data.UploadTimeInMs":900,"Data.SectionId_ResourceId":"{{Sec}}"}"""));
+        det.OnMessage(Msg($$"""{"EventName":"Office.OneNote.Storage.RealTime.NoteItService","Time":"2026-09-06T08:28:46Z","Data.Error":"No error","Data.SectionId_ResourceId":"{{Sec}}"}"""));
+
+        Assert.Empty(det.Snapshot().Sections);
+    }
+
+    [Fact]
+    public void Only_the_newest_section_sync_is_kept()
+    {
+        var det = NewDetector();
+        det.OnMessage(Msg(SectionOk("2026-09-06T08:35:00Z")));
+        det.OnMessage(Msg(SectionOk("2026-09-06T08:28:45Z")));   // replayed by the backfill, out of order
+
+        Assert.Equal(new DateTimeOffset(2026, 9, 6, 8, 35, 0, TimeSpan.Zero),
+            Assert.Single(det.Snapshot().Sections).LastSuccessUtc);
+    }
+
+    [Fact]
+    public void Results_survive_a_restart_via_the_published_status()
+    {
+        var before = NewDetector();
+        before.OnMessage(Msg(SectionOk("2026-09-06T08:28:45Z")));
+
+        var after = NewDetector();
+        Assert.Empty(after.Snapshot().Sections);
+        after.SeedSectionSuccesses(before.Snapshot().Sections);
+
+        Assert.Equal(new DateTimeOffset(2026, 9, 6, 8, 28, 45, TimeSpan.Zero),
+            Assert.Single(after.Snapshot().Sections).LastSuccessUtc);
+    }
+
     private sealed class NullSource : IEtwMessageSource
     {
         public void Process(Action<OfficeLogMessage> onMessage, CancellationToken ct) { }

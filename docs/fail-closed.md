@@ -267,6 +267,53 @@ This stays fail-closed, because it only ever removes an error on *positive* evid
 `UploadStuck` / `DownloadStuck` are exempt: those are the cloud check's own findings, and it retires
 them itself.
 
+## The cloud check infers; the collector observes — observation wins
+
+**Measured 2026-09-06.** The cloud check raised *"Van / Quick Notes — a local change at 15:28 has not
+reached OneDrive after 22 min"*. It was wrong, and three independent sources said so: OneNote's own
+Shared Notebook Synchronization dialog read **"Up to date"** for both notebooks, a manual **Sync All**
+changed nothing, and the collector had already recorded a **full section sync of Quick Notes at
+15:28:45** — one second after the local timestamp the alert called stranded.
+
+The check compares two numbers, and both can mislead:
+
+| Input | How it misleads |
+|---|---|
+| Graph `lastModifiedDateTime` for a section | can sit behind reality — here it stayed at 15:16:25 for over 45 minutes |
+| local search-index newest time | **re-stamped when a section is merely re-synced**, so a plain re-sync looks like a fresh edit that never went up |
+
+Together they manufacture a stranded change out of a section that was fine. This is the same failure
+mode as the 15 false "upload stuck" alerts that the baselining was introduced to stop; baselining
+narrowed it but could not remove it, because the inputs themselves are unreliable.
+
+The rule that does remove it:
+
+> When the collector has seen OneNote complete a **full section sync** at or after the local timestamp,
+> that section is in step with the server. OneNote's own result outranks anything inferred from
+> timestamps, and the section is re-baselined instead of alerted on.
+
+Deliberately narrow, so it cannot hide a real problem:
+
+- **Only a full `SectionSyncResult` success counts.** A page upload, a real-time round trip, or a
+  notebook-level success is not recorded as a section result and suppresses nothing. (Notebook success
+  in particular is not evidence — see the coverage table above.)
+- The success must be **at or after** the local timestamp. An earlier sync proves nothing about a later
+  change.
+- Sections are matched on a **canonical key** (`SectionKey`), because the same section appears as
+  `36B934175DC7E3A4!s8d49…`, `0-…`, `0|…` and the bare token depending on the source. A silent
+  match failure would mean an alert that can never be answered.
+- No collector, a stale status file, or an unmatched section all mean **no suppression**.
+
+Section results are published in `status.json` and reloaded on startup, because a collector restart
+would otherwise lose them and resurrect the alert. If they are lost anyway, the post-exit backfill
+replays the finished session log the next time OneNote closes, which restores them.
+
+**Also fixed here:** the local↔Graph section match fell back to matching on section name alone when the
+notebook names disagreed — which they routinely do, since the local index reports a notebook by its
+nickname ("Van") and Graph by its real name ("Note"). OneNote creates a *Quick Notes* in every
+notebook, so that fallback could compare two unrelated sections. It now requires the name to be
+unique.
+
 ## Gaps found and fixed by this review
 
 1. **Unknown events were dropped.** The parser had a hard-coded list of eight event names; anything

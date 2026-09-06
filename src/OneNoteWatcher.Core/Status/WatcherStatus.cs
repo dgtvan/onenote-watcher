@@ -12,6 +12,16 @@ public sealed record NotebookStatus(
 }
 
 /// <summary>
+/// When the collector last saw OneNote complete a FULL SECTION SYNC for this section.
+///
+/// Published because it is the strongest statement OneNote makes that a section is in step with the
+/// server, and the cloud check needs it: Graph's per-section <c>lastModifiedDateTime</c> can sit behind
+/// reality, and the local search index re-stamps a section when it is merely re-synced. Either alone
+/// produces a "change has not reached OneDrive" alert for a section that is demonstrably fine.
+/// </summary>
+public sealed record SectionSyncState(string Key, string Name, DateTimeOffset LastSuccessUtc);
+
+/// <summary>
 /// The collector's published view of the world, written to <c>status.json</c> in the shared dir and
 /// read by the tray. It lets the tray show a meaningful icon whether or not OneNote is running:
 /// "last known state" + timestamps rather than a blank grey.
@@ -26,6 +36,8 @@ public sealed record WatcherStatus
     /// <summary>When the collector last received ANY Office telemetry — the pipeline-liveness signal.</summary>
     public DateTimeOffset? LastTelemetryUtc { get; init; }
     public IReadOnlyList<NotebookStatus> Notebooks { get; init; } = [];
+    /// <summary>Last proven full-section-sync success per section, keyed by <see cref="SectionKey"/>.</summary>
+    public IReadOnlyList<SectionSyncState> Sections { get; init; } = [];
     public IReadOnlyList<SyncIssue> ActiveIssues { get; init; } = [];
 
     /// <summary>ETW records Windows dropped — a coverage gap the user should know about.</summary>
