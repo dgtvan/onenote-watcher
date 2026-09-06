@@ -41,6 +41,9 @@ public sealed class EtwSyncDetector
     /// backfill) from re-opening an error that a newer success already covered.</summary>
     private readonly Dictionary<string, DateTimeOffset> _coveredUntil = new(StringComparer.Ordinal);
     private readonly Dictionary<string, NotebookStatus> _notebooks = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Last FULL SECTION SYNC success per canonical section key — published for the cloud check,
+    /// which cannot otherwise tell a stranded change from a section OneNote has already reconciled.</summary>
+    private readonly Dictionary<string, SectionSyncState> _sectionSuccess = new(StringComparer.Ordinal);
     private readonly HashSet<string> _seenUnknownEvents = new(StringComparer.Ordinal);
     private readonly object _gate = new();
 
@@ -154,6 +157,24 @@ public sealed class EtwSyncDetector
         return closed;
     }
 
+    /// <summary>
+    /// Restore per-section sync results observed before a restart, from the status file we ourselves
+    /// published. Without this every collector restart blinds the cloud check to recent section syncs,
+    /// which is enough to resurrect a "change has not reached OneDrive" alert for a section OneNote
+    /// already reconciled. Nothing else in the old status is trusted — only these observed facts.
+    /// </summary>
+    public int SeedSectionSuccesses(IEnumerable<SectionSyncState>? sections)
+    {
+        if (sections is null) return 0;
+        lock (_gate)
+        {
+            foreach (var x in sections)
+                if (!_sectionSuccess.TryGetValue(x.Key, out var had) || x.LastSuccessUtc > had.LastSuccessUtc)
+                    _sectionSuccess[x.Key] = x;
+            return _sectionSuccess.Count;
+        }
+    }
+
     /// <summary>Add an externally-detected health issue (e.g. an unreadable config) to the published set.</summary>
     public void AddHealthIssue(string key, SyncIssue issue)
     {
@@ -237,6 +258,19 @@ public sealed class EtwSyncDetector
                 else if (ev.Outcome == SyncOutcome.Success)
                 {
                     changed |= ClearCoveredBy(ev, names, t);
+
+                    // Only a completed SECTION sync counts here. A page upload or a real-time round trip
+                    // moves some content but does not assert the section is in step with the server, and
+                    // this record is used to retire cloud-check alerts — so it must mean what it says.
+                    if (ev.Kind == SyncEventKind.SectionSyncResult
+                        && SectionKey.Normalize(ev.SectionResourceId ?? ev.SectionGosid ?? names.Section) is { } sk)
+                    {
+                        if (!_sectionSuccess.TryGetValue(sk, out var had) || t > had.LastSuccessUtc)
+                        {
+                            _sectionSuccess[sk] = new SectionSyncState(sk, names.Section ?? sk, t);
+                            changed = true;
+                        }
+                    }
 
                     if (ev.IsSyncActivity)
                     {
@@ -338,6 +372,7 @@ public sealed class EtwSyncDetector
                 LastSyncEventUtc = _lastActivity,
                 LastTelemetryUtc = _lastMessageAt,
                 Notebooks = PublishNotebooks(),
+                Sections = _sectionSuccess.Values.OrderBy(x => x.Name, StringComparer.OrdinalIgnoreCase).ToList(),
                 ActiveIssues = _active.Values.Select(v => v.Issue).ToList(),
                 EventsLost = EventsLost,
                 MalformedPayloads = MalformedPayloads,

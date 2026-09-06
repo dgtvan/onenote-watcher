@@ -3,6 +3,7 @@ using OneNoteWatcher.Core.Graph;
 using OneNoteWatcher.Core.Index;
 using OneNoteWatcher.Core.Logging;
 using OneNoteWatcher.Core.Model;
+using OneNoteWatcher.Core.Status;
 
 namespace OneNoteWatcher;
 
@@ -47,7 +48,10 @@ public sealed class GraphPoller
         if (restored > 0) _log?.Info($"restored cloud-check baseline for {restored} section(s) — a change stranded before a reboot is still flagged");
     }
 
-    public async Task<IReadOnlyList<SyncIssue>> PollAsync(bool oneNoteRunning, bool? internet, CancellationToken ct)
+    /// <param name="collectorSections">The collector's per-section sync results, when it is running.
+    /// OneNote's own outcome beats this class's timestamp inference.</param>
+    public async Task<IReadOnlyList<SyncIssue>> PollAsync(bool oneNoteRunning, bool? internet, CancellationToken ct,
+        IReadOnlyList<SectionSyncState>? collectorSections = null)
     {
         var wasSignedIn = SignedIn;
         SignedIn = await _auth.TryGetTokenSilentAsync(ct) is not null;
@@ -60,9 +64,9 @@ public sealed class GraphPoller
             var map = SectionNameMap.FromSnapshot(LastSnapshot);
             map.Save(_sectionMapPath);
             _index.RefreshIfStale(TimeSpan.FromMinutes(1));
-            var issues = _outcome.Evaluate(_index, LastSnapshot, oneNoteRunning, internet);
+            var issues = _outcome.Evaluate(_index, LastSnapshot, oneNoteRunning, internet, null, collectorSections);
             _outcome.SaveState(_statePath);   // survives tray restart / reboot
-            _log?.Info($"graph poll: {LastSnapshot.Notebooks.Count} notebooks, {LastSnapshot.Sections.Count} sections, map keys={map.Count}, baselined={_outcome.BaselinedSections}, outcome issues={issues.Count}");
+            _log?.Info($"graph poll: {LastSnapshot.Notebooks.Count} notebooks, {LastSnapshot.Sections.Count} sections, map keys={map.Count}, baselined={_outcome.BaselinedSections}, collector sections={collectorSections?.Count ?? 0}, outcome issues={issues.Count}");
             foreach (var i in issues) _log?.Warn($"outcome issue {i.Location}: {i.Message}");
             return issues;
         }

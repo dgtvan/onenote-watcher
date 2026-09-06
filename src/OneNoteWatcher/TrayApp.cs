@@ -164,7 +164,11 @@ public sealed class TrayApp : IDisposable
     {
         if (_graph is null || _graphBusy || _simulate) return;
         _graphBusy = true;
-        try { _graphIssues = await _graph.PollAsync(OneNoteRunning(), _status?.InternetAvailable, CancellationToken.None); }
+        // the collector's own results go in, so a section OneNote has already reconciled is not
+        // reported as a stranded change on the strength of two lagging timestamps
+        var sections = _status is not null && DateTimeOffset.UtcNow - _status.UpdatedUtc < TimeSpan.FromMinutes(2)
+            ? _status.Sections : null;
+        try { _graphIssues = await _graph.PollAsync(OneNoteRunning(), _status?.InternetAvailable, CancellationToken.None, sections); }
         catch (Exception ex) { _log.Error("graph poll failed", ex); _graphIssues = []; }
         finally { _graphBusy = false; }
         Refresh();

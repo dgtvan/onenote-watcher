@@ -35,6 +35,9 @@ public sealed record SyncIssue
     /// <summary>The nickname set in OneNote's navigation pane when it differs from <see cref="NotebookName"/>.</summary>
     public string? NotebookDisplayName { get; init; }
     public string? SectionName { get; init; }
+    /// <summary>The section's OneDrive/Graph resource id when known, so a finding can be matched to the
+    /// collector's per-section results across the several id spellings (see <see cref="SectionKey"/>).</summary>
+    public string? SectionId { get; init; }
     public string? PageTitle { get; init; }
 
     /// <summary>The OneNote telemetry event this came from, so <c>[ignore] events</c> can target it.</summary>
