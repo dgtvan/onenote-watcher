@@ -11,10 +11,15 @@ Targets the Win32 Microsoft 365 build of OneNote (`ONENOTE.EXE`) on Windows 10/1
 ## Install / uninstall (Administrator PowerShell)
 
 ```powershell
-.\scripts\install.ps1                 # first time: build, install, register auto-start, start
-.\scripts\install.ps1 -UpdateOnly     # after a code change: rebuild, swap binaries, restart
+.\scripts\install.ps1                 # full install: build, register auto-start, start (replaces config.ini)
+.\scripts\install.ps1 -UpdateOnly     # after a code change: swap binaries only (keeps config.ini)
 .\scripts\uninstall.ps1               # remove app + auto-start (keeps logs; -PurgeData removes them)
 ```
+
+A **full install replaces `config.ini`** with the copy from this repo, so a reinstall gives a clean,
+predictable state and newly added settings actually arrive. Your previous file is saved beside it as
+`config.ini.bak-<timestamp>`. Use **`-UpdateOnly`** when you have settings to keep: it swaps the
+binaries and never touches your config.
 
 Then once, from the tray: **Show issues & status → Sign in to Graph…** (a device code; gives section
 names in failures and the cloud-side check). Your Graph client id is already in

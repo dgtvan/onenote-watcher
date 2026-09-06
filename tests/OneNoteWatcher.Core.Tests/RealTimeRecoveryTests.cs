@@ -1,4 +1,6 @@
+using OneNoteWatcher.Core;
 using OneNoteWatcher.Core.Detection;
+using OneNoteWatcher.Core.Health;
 using OneNoteWatcher.Core.Diagnosis;
 using OneNoteWatcher.Core.Graph;
 using OneNoteWatcher.Core.Model;
@@ -110,5 +112,60 @@ public class CloudConfirmationTests
         d.Evaluate(Local(localNow), Server(t0.AddMinutes(1)), true, true, localNow);
 
         Assert.False(d.CloudConfirmedAfter("Note", "eSim Data", t0));
+    }
+}
+
+/// <summary>
+/// Reported 2026-09-06: after a 3 h sleep the watcher said "The Microsoft Graph check is not running"
+/// and told the user to sign in — while they WERE signed in and no sign-in button was even shown.
+/// </summary>
+public class GraphStaleDiagnosisTests
+{
+    [Fact]
+    public void A_stalled_poll_is_not_diagnosed_as_a_sign_in_problem()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var issue = HealthIssues.GraphStale(TimeSpan.FromHours(3), now.AddHours(-3), now);
+
+        Assert.NotEqual(IssueKind.AuthRequired, issue.Kind);
+        Assert.NotEqual(FailureCategory.Permission, issue.Category);
+        Assert.DoesNotContain("Sign in", issue.Recommendation, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Check now", issue.Recommendation);
+    }
+
+    [Fact]
+    public void An_expired_sign_in_still_is_an_auth_problem_with_the_sign_in_action()
+    {
+        var issue = HealthIssues.GraphTokenExpired(DateTimeOffset.UtcNow);
+
+        Assert.Equal(IssueKind.AuthRequired, issue.Kind);
+        Assert.Contains("Sign in", issue.Recommendation);
+    }
+}
+
+public class AwakeClockTests
+{
+    [Fact]
+    public void The_os_counter_is_available_on_this_platform()
+    {
+        Assert.True(AwakeClock.Available);
+    }
+
+    [Fact]
+    public void Elapsed_never_exceeds_the_time_we_were_awake()
+    {
+        var stamp = AwakeClock.Stamp();
+        var wallSince = DateTimeOffset.UtcNow.AddHours(-3);   // as if the machine slept for three hours
+
+        var elapsed = AwakeClock.Elapsed(wallSince, DateTimeOffset.UtcNow, stamp);
+
+        Assert.True(elapsed < TimeSpan.FromMinutes(1), $"reported {elapsed} of running time after no running time");
+    }
+
+    [Fact]
+    public void Elapsed_never_exceeds_the_wall_clock_either()
+    {
+        var now = DateTimeOffset.UtcNow;
+        Assert.True(AwakeClock.Elapsed(now, now, AwakeClock.Stamp() - TimeSpan.FromHours(5)) < TimeSpan.FromSeconds(1));
     }
 }

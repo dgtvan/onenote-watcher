@@ -91,16 +91,28 @@ public class NotebookTableTests : IDisposable
 
         var pub = Assert.Single(det.Snapshot().Sections);
         Assert.Equal(OneNoteWatcher.Core.Model.SectionKey.Normalize(Sec), pub.Key);
-        Assert.Equal(new DateTimeOffset(2026, 9, 6, 8, 28, 45, TimeSpan.Zero), pub.LastSuccessUtc);
+        Assert.Equal(new DateTimeOffset(2026, 9, 6, 8, 28, 45, TimeSpan.Zero), pub.LastHealthySyncUtc);
     }
 
     [Fact]
-    public void Weaker_successes_are_not_published_as_a_section_sync()
+    public void Real_time_and_page_activity_also_count_as_healthy_sync()
     {
         var det = NewDetector();
-        // a page upload and a real-time round trip move content but do not assert the section is in step
+        // The index is re-stamped by ANY reconciliation, so any healthy section activity explains the
+        // stamp. Measured 2026-09-06: a section went hours with real-time activity and no section sync,
+        // so requiring a full section sync made the explanation unobtainable.
         det.OnMessage(Msg($$"""{"EventName":"Office.OneNote.Storage.RealTime.NoteItHttpUpload","Time":"2026-09-06T08:28:45Z","Data.UploadTimeInMs":900,"Data.SectionId_ResourceId":"{{Sec}}"}"""));
         det.OnMessage(Msg($$"""{"EventName":"Office.OneNote.Storage.RealTime.NoteItService","Time":"2026-09-06T08:28:46Z","Data.Error":"No error","Data.SectionId_ResourceId":"{{Sec}}"}"""));
+
+        Assert.Equal(new DateTimeOffset(2026, 9, 6, 8, 28, 46, TimeSpan.Zero),
+            Assert.Single(det.Snapshot().Sections).LastHealthySyncUtc);
+    }
+
+    [Fact]
+    public void A_failed_event_never_counts_as_healthy_sync()
+    {
+        var det = NewDetector();
+        det.OnMessage(Msg(RealTimeFail("2026-09-06T08:33:19Z")));
 
         Assert.Empty(det.Snapshot().Sections);
     }
@@ -113,7 +125,7 @@ public class NotebookTableTests : IDisposable
         det.OnMessage(Msg(SectionOk("2026-09-06T08:28:45Z")));   // replayed by the backfill, out of order
 
         Assert.Equal(new DateTimeOffset(2026, 9, 6, 8, 35, 0, TimeSpan.Zero),
-            Assert.Single(det.Snapshot().Sections).LastSuccessUtc);
+            Assert.Single(det.Snapshot().Sections).LastHealthySyncUtc);
     }
 
     [Fact]
@@ -127,7 +139,7 @@ public class NotebookTableTests : IDisposable
         after.SeedSectionSuccesses(before.Snapshot().Sections);
 
         Assert.Equal(new DateTimeOffset(2026, 9, 6, 8, 28, 45, TimeSpan.Zero),
-            Assert.Single(after.Snapshot().Sections).LastSuccessUtc);
+            Assert.Single(after.Snapshot().Sections).LastHealthySyncUtc);
     }
 
     private sealed class NullSource : IEtwMessageSource

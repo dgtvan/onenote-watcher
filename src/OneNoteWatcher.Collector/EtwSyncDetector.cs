@@ -35,13 +35,15 @@ public sealed class EtwSyncDetector
     private readonly TransientPolicy _transient;
     private readonly Action<WatcherStatus>? _onStatusChanged;
     private readonly Func<bool> _oneNoteRunning;
+    /// <summary>Awake-time source; injectable so the sleep rule can be tested against a simulated clock.</summary>
+    private readonly Func<TimeSpan> _awakeNow;
 
     private readonly Dictionary<string, ActiveEntry> _active = new(StringComparer.Ordinal);
     /// <summary>Latest proven success per scope — stops a stale failure (e.g. replayed by the post-exit
     /// backfill) from re-opening an error that a newer success already covered.</summary>
     private readonly Dictionary<string, DateTimeOffset> _coveredUntil = new(StringComparer.Ordinal);
     private readonly Dictionary<string, NotebookStatus> _notebooks = new(StringComparer.OrdinalIgnoreCase);
-    /// <summary>Last FULL SECTION SYNC success per canonical section key — published for the cloud check,
+    /// <summary>Last healthy sync activity per canonical section key — published for the cloud check,
     /// which cannot otherwise tell a stranded change from a section OneNote has already reconciled.</summary>
     private readonly Dictionary<string, SectionSyncState> _sectionSuccess = new(StringComparer.Ordinal);
     private readonly HashSet<string> _seenUnknownEvents = new(StringComparer.Ordinal);
@@ -52,6 +54,10 @@ public sealed class EtwSyncDetector
     /// <summary>When the source last delivered ANY telemetry — the pipeline-liveness signal.</summary>
     private DateTimeOffset? _lastMessageAt;
     private readonly DateTimeOffset _startedUtc = DateTimeOffset.UtcNow;
+    /// <summary>Awake-time stamps for the liveness watchdog, so a suspended machine is not counted as
+    /// silence we observed (see <see cref="AwakeClock"/>).</summary>
+    private readonly TimeSpan _startedAwake;
+    private TimeSpan _lastMessageAwake;
     private bool _oneNoteWasRunning;
 
     public int MessagesSeen { get; private set; }
@@ -63,8 +69,11 @@ public sealed class EtwSyncDetector
 
     public EtwSyncDetector(IEtwMessageSource source, SyncHistoryLog history, NameResolver? names = null,
         Action<WatcherStatus>? onStatusChanged = null, Func<bool>? oneNoteRunning = null, AppLog? log = null,
-        TransientPolicy? transient = null)
+        TransientPolicy? transient = null, Func<TimeSpan>? awakeClock = null)
     {
+        _awakeNow = awakeClock ?? AwakeClock.Stamp;
+        _startedAwake = _awakeNow();
+        _lastMessageAwake = _startedAwake;
         _source = source; _history = history; _log = log;
         _names = names ?? new NameResolver();
         _transient = transient ?? TransientPolicy.Default;
@@ -107,8 +116,18 @@ public sealed class EtwSyncDetector
             // but Office telemetry never stops for more than ~17 min on a healthy machine.
             // NEVER claim more silence than we have actually been watching for — after a restart the
             // backfill sets _lastActivity from HISTORICAL data, which is not evidence of live silence.
-            var watchingSince = _lastMessageAt is { } m && m > _startedUtc ? m : _startedUtc;
-            var since = now - watchingSince;
+            // Two things must not be counted as silence we observed: time before this collector started,
+            // and time the machine spent asleep. The first is clamped by taking the later of the two
+            // stamps; the second by measuring in awake time.
+            var startedLater = _lastMessageAt is not { } m || m <= _startedUtc;
+            var watchingSince = startedLater ? _startedUtc : _lastMessageAt!.Value;
+            var awakeStamp = startedLater ? _startedAwake : _lastMessageAwake;
+            // never report more silence than we were actually awake to observe, nor more than the
+            // wall clock allows — the smaller of the two can only under-report, never invent an alarm
+            var wall = now - watchingSince;
+            var awake = _awakeNow() - awakeStamp;
+            var since = wall < awake ? wall : awake;
+            if (since < TimeSpan.Zero) since = TimeSpan.Zero;
             changed |= _oneNoteRunning() && since > activityTimeout
                 ? SetHealth(HealthIssues.KeyStaleActivity, HealthIssues.PipelineSilent(since, activityTimeout, now))
                 : RemoveHealth(HealthIssues.KeyStaleActivity);
@@ -169,7 +188,7 @@ public sealed class EtwSyncDetector
         lock (_gate)
         {
             foreach (var x in sections)
-                if (!_sectionSuccess.TryGetValue(x.Key, out var had) || x.LastSuccessUtc > had.LastSuccessUtc)
+                if (!_sectionSuccess.TryGetValue(x.Key, out var had) || x.LastHealthySyncUtc > had.LastHealthySyncUtc)
                     _sectionSuccess[x.Key] = x;
             return _sectionSuccess.Count;
         }
@@ -187,6 +206,7 @@ public sealed class EtwSyncDetector
     {
         MessagesSeen++;
         _lastMessageAt = DateTimeOffset.UtcNow;
+        _lastMessageAwake = _awakeNow();
         if (!SyncEventJson.LooksLikeSyncSendEvent(msg.Message)) return;
         var ev = SyncEventJson.TryParse(msg.Message, out var malformed);
         if (malformed) MalformedPayloads++;
@@ -259,13 +279,17 @@ public sealed class EtwSyncDetector
                 {
                     changed |= ClearCoveredBy(ev, names, t);
 
-                    // Only a completed SECTION sync counts here. A page upload or a real-time round trip
-                    // moves some content but does not assert the section is in step with the server, and
-                    // this record is used to retire cloud-check alerts — so it must mean what it says.
-                    if (ev.Kind == SyncEventKind.SectionSyncResult
+                    // Any healthy section-scoped activity counts, not just a full section sync. This
+                    // record answers "why did the local timestamp move?", and OneNote re-stamps the
+                    // search index on ANY reconciliation — a real-time round trip or a page transfer
+                    // included. Measured 2026-09-06: a section can go hours with healthy real-time and
+                    // notebook activity and no SectionSyncResult at all, so requiring one made the
+                    // answer unobtainable and left a false alert standing for over four hours.
+                    if (ev.Kind is SyncEventKind.SectionSyncResult or SyncEventKind.RealTimeService
+                                or SyncEventKind.PageUpload or SyncEventKind.PageDownload
                         && SectionKey.Normalize(ev.SectionResourceId ?? ev.SectionGosid ?? names.Section) is { } sk)
                     {
-                        if (!_sectionSuccess.TryGetValue(sk, out var had) || t > had.LastSuccessUtc)
+                        if (!_sectionSuccess.TryGetValue(sk, out var had) || t > had.LastHealthySyncUtc)
                         {
                             _sectionSuccess[sk] = new SectionSyncState(sk, names.Section ?? sk, t);
                             changed = true;

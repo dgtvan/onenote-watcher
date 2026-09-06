@@ -37,7 +37,6 @@ public sealed class TrayApp : IDisposable
     private bool _pulseBright;
     private TrayIcons.State _state = TrayIcons.State.Error;   // fail-closed until proven healthy
     private string _stateReason = "";
-    private Icon? _current;
     private WatcherStatus? _status;
     private readonly Dictionary<string, SyncIssue> _localIssues = new();
     private IReadOnlyList<SyncIssue> _graphIssues = [];
@@ -79,10 +78,21 @@ public sealed class TrayApp : IDisposable
         {
             _graphEnabled = true;
             _graphAuth = new GraphAuth(clientId, ini.Get("graph", "tenant", "consumers"));
-            _graph = new GraphPoller(_graphAuth, TimeSpan.FromMinutes(ini.GetInt("general", "grace_minutes", 10)), _sharedDir, _log);
+            _graph = new GraphPoller(_graphAuth, TimeSpan.FromMinutes(ini.GetInt("general", "grace_minutes", 10)),
+                _sharedDir, _log, TimeSpan.FromMinutes(ini.GetInt("general", "unconfirmed_minutes", 120)));
             _graphTimer.Interval = Math.Max(1, ini.GetInt("general", "poll_minutes", 5)) * 60_000;
             _graphTimer.Tick += async (_, _) => { try { await PollGraphAsync(); } catch (Exception ex) { _log.Error("graph timer", ex); } };
             _graphTimer.Start();
+
+            // A resume from sleep is exactly when the cloud picture is most out of date, and waiting a
+            // whole poll interval leaves the watcher reporting a stale view of OneDrive. Re-check at once.
+            Microsoft.Win32.SystemEvents.PowerModeChanged += (_, e) =>
+            {
+                if (e.Mode != Microsoft.Win32.PowerModes.Resume) return;
+                _log.Info("machine resumed from sleep — re-checking the cloud side now");
+                try { _tray.ContextMenuStrip?.BeginInvoke(() => _ = PollGraphAsync()); }
+                catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
+            };
         }
         else _log.Info("Graph disabled or no client_id");
 
@@ -232,8 +242,8 @@ public sealed class TrayApp : IDisposable
                     : HealthIssues.GraphBlind("not signed in", now);
             else if (_graph.LastError is not null && _graph.LastFetchUtc is null)
                 yield return HealthIssues.GraphBlind($"every attempt failed: {_graph.LastError}", now);
-            else if (_graph.LastFetchUtc is { } f && DateTimeOffset.UtcNow - f > TimeSpan.FromMinutes(90))
-                yield return HealthIssues.GraphBlind($"last successful check {f.ToLocalTime():HH:mm}", now);
+            else if (_graph.LastFetchUtc is { } f && _graph.SinceLastFetch > TimeSpan.FromMinutes(90))
+                yield return HealthIssues.GraphStale(_graph.SinceLastFetch, f, now);
         }
 
         if (!_oalerts.Available)
@@ -346,8 +356,9 @@ public sealed class TrayApp : IDisposable
 
     private void ApplyIcon()
     {
-        var next = TrayIcons.Make(_state, _pulseBright);
-        _tray.Icon = next; _current?.Dispose(); _current = next;
+        // icons are cached and shared by TrayIcons — never dispose them here (that is what leaked the
+        // native handle behind the GDI+ crash), just point the tray at the right one
+        _tray.Icon = TrayIcons.Make(_state, _pulseBright);
     }
 
     private static bool OneNoteRunning() => Process.GetProcessesByName("ONENOTE").Length > 0;
@@ -394,6 +405,6 @@ public sealed class TrayApp : IDisposable
     {
         _log.Info("tray dispose");
         _pollTimer.Dispose(); _pulseTimer.Dispose(); _graphTimer.Dispose(); _oalerts.Dispose();
-        _tray.Visible = false; _tray.Dispose(); _current?.Dispose();
+        _tray.Visible = false; _tray.Dispose();
     }
 }

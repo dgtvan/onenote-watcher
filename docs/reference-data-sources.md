@@ -64,7 +64,9 @@ section map below.
 Executables + `config.ini` + `status.json` + `section-names.json` + `logs\` all live in this single
 root (`[etw] shared_dir`, defaulting to the executables' own folder). It is under ProgramData rather
 than Program Files because the *unelevated* tray must write there too. `install.ps1 -UpdateOnly`
-swaps the binaries in place; nothing else moves.
+swaps the binaries in place and keeps your `config.ini`; a full `install.ps1` also replaces
+`config.ini` from the repo, saving the old one as `config.ini.bak-<timestamp>`. `status.json`,
+`section-names.json` and the logs folder are never touched by either.
 
 | File | Writer | Content |
 |---|---|---|

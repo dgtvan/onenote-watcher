@@ -12,14 +12,16 @@ public sealed record NotebookStatus(
 }
 
 /// <summary>
-/// When the collector last saw OneNote complete a FULL SECTION SYNC for this section.
+/// When the collector last saw OneNote complete HEALTHY sync activity for this section — a section
+/// sync, a real-time session, or a page transfer that reported success.
 ///
-/// Published because it is the strongest statement OneNote makes that a section is in step with the
-/// server, and the cloud check needs it: Graph's per-section <c>lastModifiedDateTime</c> can sit behind
-/// reality, and the local search index re-stamps a section when it is merely re-synced. Either alone
-/// produces a "change has not reached OneDrive" alert for a section that is demonstrably fine.
+/// This exists to answer one question the cloud check cannot answer on its own: <b>why did this
+/// section's local timestamp move?</b> OneNote's search index re-stamps a section whenever it is
+/// reconciled, including reconciliations that change nothing on the server, so "local newer than the
+/// server copy" is not evidence of an unsent change. If the collector saw the section sync healthily at
+/// that moment, the movement is explained and there is nothing stranded.
 /// </summary>
-public sealed record SectionSyncState(string Key, string Name, DateTimeOffset LastSuccessUtc);
+public sealed record SectionSyncState(string Key, string Name, DateTimeOffset LastHealthySyncUtc);
 
 /// <summary>
 /// The collector's published view of the world, written to <c>status.json</c> in the shared dir and
@@ -36,7 +38,7 @@ public sealed record WatcherStatus
     /// <summary>When the collector last received ANY Office telemetry — the pipeline-liveness signal.</summary>
     public DateTimeOffset? LastTelemetryUtc { get; init; }
     public IReadOnlyList<NotebookStatus> Notebooks { get; init; } = [];
-    /// <summary>Last proven full-section-sync success per section, keyed by <see cref="SectionKey"/>.</summary>
+    /// <summary>Last healthy sync activity per section, keyed by <see cref="SectionKey"/>.</summary>
     public IReadOnlyList<SectionSyncState> Sections { get; init; } = [];
     public IReadOnlyList<SyncIssue> ActiveIssues { get; init; } = [];
 

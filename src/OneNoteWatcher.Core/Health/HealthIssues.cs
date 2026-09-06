@@ -93,6 +93,21 @@ public static class HealthIssues
         "Open 'Show issues & status' and click 'Sign in to Graph…'. If already signed in, check the tray log for the error.",
         now);
 
+    /// <summary>
+    /// The cloud check is signed in but has not completed a poll recently. Deliberately NOT an auth
+    /// issue: telling a signed-in user to sign in is wrong, and the sign-in button is not even shown to
+    /// them, so the advice pointed at a control that was not on screen.
+    /// </summary>
+    public static SyncIssue GraphStale(TimeSpan since, DateTimeOffset lastOk, DateTimeOffset now) => Make(
+        KeyGraphBlind, IssueKind.SourceUnavailable, FailureCategory.Unknown,
+        "cloud-side check has stopped running",
+        $"The watcher is signed in, but its cloud check has not completed since {lastOk.ToLocalTime():HH:mm} " +
+        $"({Human(since)} of running time). Until it runs again the watcher cannot confirm that your local " +
+        "changes actually reached OneDrive.",
+        "Right-click the tray icon and choose 'Check now'. If it stays stuck, check the tray log for the " +
+        "error and restart the watcher.",
+        now);
+
     public static SyncIssue OAlertsUnavailable(DateTimeOffset now) => Make(
         KeyOAlertsUnavailable, IssueKind.SourceUnavailable, FailureCategory.Unknown,
         "OneNote error dialogs are not being watched",
