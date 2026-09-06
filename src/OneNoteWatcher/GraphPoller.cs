@@ -26,6 +26,16 @@ public sealed class GraphPoller
     public string? LastError { get; private set; }
     public bool SignedIn { get; private set; }
 
+    /// <summary>
+    /// True when OneDrive has positively confirmed this section's content at a time later than
+    /// <paramref name="t"/>. Used to retire a real-time sync error that OneNote never followed with a
+    /// success event. Requires a recent successful poll — a stale or failed cloud check confirms nothing.
+    /// </summary>
+    public bool CloudConfirmedAfter(string? notebook, string? section, DateTimeOffset t) =>
+        SignedIn && LastError is null
+        && LastFetchUtc is { } f && DateTimeOffset.UtcNow - f < TimeSpan.FromMinutes(30)
+        && _outcome.CloudConfirmedAfter(notebook, section, t);
+
     public GraphPoller(GraphAuth auth, TimeSpan grace, string sharedDir, AppLog? log = null)
     {
         _auth = auth; _log = log;
