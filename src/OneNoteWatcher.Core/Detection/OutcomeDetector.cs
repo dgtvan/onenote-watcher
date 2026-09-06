@@ -27,6 +27,10 @@ public sealed class OutcomeDetector
     private readonly TimeSpan _grace;
     private readonly Dictionary<string, (DateTimeOffset local, DateTimeOffset? server)> _baseline = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTimeOffset> _aheadSince = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Per section: the server timestamp at the last poll where OneDrive was NOT behind the local
+    /// copy. This is positive proof that the section's content reached the cloud — see
+    /// <see cref="CloudConfirmedAfter"/>.</summary>
+    private readonly Dictionary<string, DateTimeOffset> _cloudConfirmed = new(StringComparer.OrdinalIgnoreCase);
 
     public OutcomeDetector(TimeSpan grace) => _grace = grace;
 
@@ -62,6 +66,16 @@ public sealed class OutcomeDetector
             var localMoved = localNewest > b.local;
             var serverMoved = serverNewest > (b.server ?? DateTimeOffset.MinValue);
             var serverCaughtUp = serverNewest >= localNewest - SyncTolerance;
+
+            // OneDrive is not behind this PC for this section: its content is safely on the server as of
+            // serverNewest. Recorded so a real-time sync error the collector saw EARLIER than this can be
+            // retired on direct evidence instead of standing forever (OneNote does not always emit a
+            // success event after it recovers).
+            if (serverCaughtUp)
+            {
+                if (!_cloudConfirmed.TryGetValue(key, out var had) || serverNewest > had)
+                    _cloudConfirmed[key] = serverNewest;
+            }
 
             if (localMoved && (serverCaughtUp || serverMoved))
             {
@@ -107,6 +121,22 @@ public sealed class OutcomeDetector
             if (!localMoved) _baseline[key] = (b.local, serverNewest); // keep server side current
         }
         return issues;
+    }
+
+    /// <summary>
+    /// Did OneDrive confirm content for this section AFTER <paramref name="t"/>? True only when a poll
+    /// actually compared the two sides and found the server at or ahead of this PC, and the server's own
+    /// timestamp is later than <paramref name="t"/>. Anything less returns false, so a failure we cannot
+    /// positively disprove keeps standing.
+    /// </summary>
+    public bool CloudConfirmedAfter(string? notebook, string? section, DateTimeOffset t)
+    {
+        if (string.IsNullOrEmpty(section)) return false;
+        if (notebook is not null && _cloudConfirmed.TryGetValue($"{notebook}/{section}", out var exact))
+            return exact > t;
+        // notebook names can differ between the ETW event and Graph; fall back to a unique section match
+        var hits = _cloudConfirmed.Where(kv => kv.Key.EndsWith("/" + section, StringComparison.OrdinalIgnoreCase)).ToList();
+        return hits.Count == 1 && hits[0].Value > t;
     }
 
     /// <summary>

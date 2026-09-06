@@ -227,6 +227,46 @@ event name). A success elsewhere never masks a failure here.
 | Events emitted while the collector was down | Diagnostic-log backfill of finished sessions at startup |
 | A failure with no telemetry at all | Independent cloud-side check (local index ⟷ Graph) + OAlerts dialog watcher |
 
+## Telemetry alone cannot clear every error — the cloud check must
+
+**Measured 2026-09-06.** OneNote's real-time channel reported an upload failure on `Note / eSim Data`:
+
+```
+15:33:19  Office.OneNote.Storage.RealTime.NoteItService
+          OperationWithError = "Http Patch for Upload Failed"
+          Error = "Win32Error: ErrOutOfSyncWithStore (0xE000002E) tag_4oxx9"
+```
+
+The content **was** on the server moments later (confirmed on the user's phone, and by our own Graph
+poll). OneNote then emitted **no further `Storage.*` event for that section at all** — verified, not
+assumed: the collector parsed exactly 7 sync events in that window and the history log holds exactly
+those 7, so nothing was dropped. Office telemetry kept flowing the whole time, so the pipeline was
+alive; there simply was no recovery event to see.
+
+The consequence: **an error raised from telemetry can have no telemetry that clears it.** The coverage
+rules above are necessary but not sufficient, and a confirmed failure has no TTL by design, so the tray
+would have stayed red forever over a sync that actually succeeded.
+
+The fix is a second, independent source of proof rather than a timeout:
+
+> A section-scoped collector error is retired when the **cloud check** shows OneDrive holding content
+> for that section stamped **later than the failure**, at a poll where the server was **not behind**
+> this PC.
+
+This stays fail-closed, because it only ever removes an error on *positive* evidence from the server:
+
+| Situation | Error stays? |
+|---|---|
+| Not signed in to Graph, or the last poll failed | **yes** |
+| Last successful poll older than 30 min | **yes** |
+| Section never compared (not in Graph, or no local match) | **yes** |
+| Server timestamp not later than the failure | **yes** |
+| Server behind the local copy (`serverCaughtUp` false) | **yes** |
+| Server confirmed ahead of the failure | cleared, and written to the history as `RECOVERED` |
+
+`UploadStuck` / `DownloadStuck` are exempt: those are the cloud check's own findings, and it retires
+them itself.
+
 ## Gaps found and fixed by this review
 
 1. **Unknown events were dropped.** The parser had a hard-coded list of eight event names; anything
@@ -240,6 +280,19 @@ event name). A success elsewhere never masks a failure here.
    the backfill. Fixed by reading exactly one JSON value. The audit's malformed count went 2 → **0**.
 5. **`[transient]` was advertised in config.ini but never implemented.** Now implemented with
    escalation.
+6. **Error codes embedded in free text were never read.** The code was taken only from numeric
+   `*ErrorCode` fields, but the real-time channel puts it inside the message —
+   `"Win32Error: ErrOutOfSyncWithStore (0xE000002E)"`. So `ErrorCatalog` was never consulted and the
+   category was guessed from words in the text: `0xE000002E` came out as **Network — "could not be
+   reached"** when the catalogue holds the correct **Conflict — "out of sync with the copy in
+   OneDrive"** plus real remediation steps. Any `0x########` in error text is now extracted.
+7. **The NOTEBOOKS table could not show a failure.** It was written only on a *successful* event, so a
+   notebook whose only event was an error was missing from the table entirely, and one that failed
+   after an earlier success kept reading `OK`. The published table is now derived from the live issue
+   set, so it can never disagree with the PROBLEMS list.
+8. **The history file had one writer.** The tray now records a `RECOVERED` line, so appends open
+   `FileShare.ReadWrite` and retry briefly — otherwise a collision would have been miscounted as a
+   logging failure and raised an alert of its own.
 
 ## Evidence — audit over this machine's real logs
 

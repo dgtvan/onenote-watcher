@@ -32,6 +32,9 @@ public static class SyncEventJson
     /// <summary>Field-name pattern for numeric error codes (Error_Code, NotebookErrorCode, SH_ErrorCode, …).</summary>
     private static readonly Regex ErrorCodeField = new(@"^Data\.[A-Za-z0-9_.]*Error_?Code$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    /// <summary>An 8-digit hex code embedded in free-text error output, e.g. "(0xE000002E)".</summary>
+    private static readonly Regex EmbeddedHexCode = new(@"0x([0-9A-Fa-f]{8})(?![0-9A-Fa-f])", RegexOptions.Compiled);
+
     /// <summary>Field-name pattern for error text.</summary>
     private static readonly Regex ErrorTextField = new(@"^Data\.(Error|Error_Description|Error_Type|OperationWithError|FailureReason|ErrorMessage)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
@@ -147,6 +150,18 @@ public static class SyncEventJson
                     }
                 }
             }
+            // Some events carry the code ONLY inside the error text, e.g. the real-time channel's
+            // Data.Error = "Win32Error: ErrOutOfSyncWithStore (0xE000002E) tag_4oxx9". Without this the
+            // ErrorCatalog is never consulted and the user gets a guessed category and generic advice —
+            // exactly the "a general error is useless" failure mode. Field values still win.
+            if (code == 0 && errorText is not null)
+            {
+                var m = EmbeddedHexCode.Match(errorText);
+                if (m.Success && uint.TryParse(m.Groups[1].Value, System.Globalization.NumberStyles.HexNumber,
+                        System.Globalization.CultureInfo.InvariantCulture, out var embedded) && embedded != 0)
+                    code = embedded;
+            }
+
             // real-time channel: "Upload" + "HTTP 503 …" → "Upload: HTTP 503 …"
             if (errorFields.TryGetValue("Data.OperationWithError", out var op))
                 errorText = errorText is null ? op

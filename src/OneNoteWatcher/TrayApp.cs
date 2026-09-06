@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using OneNoteWatcher.Core.Config;
 using OneNoteWatcher.Core.Health;
+using OneNoteWatcher.Core.History;
 using OneNoteWatcher.Core.Logging;
 using OneNoteWatcher.Core.Model;
 using OneNoteWatcher.Core.Rules;
@@ -40,6 +41,9 @@ public sealed class TrayApp : IDisposable
     private WatcherStatus? _status;
     private readonly Dictionary<string, SyncIssue> _localIssues = new();
     private IReadOnlyList<SyncIssue> _graphIssues = [];
+    /// <summary>Dedupe keys already reported as cloud-cleared, so the log says it once.</summary>
+    private readonly HashSet<string> _cloudCleared = new(StringComparer.Ordinal);
+    private readonly SyncHistoryLog _history;
     private List<SyncIssue> _issues = [];
     private string _lastBalloonKey = "";
     private bool _graphBusy;
@@ -64,6 +68,7 @@ public sealed class TrayApp : IDisposable
         _statusPath = Path.Combine(_sharedDir, "status.json");
         try { Directory.CreateDirectory(_logsDir); } catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         _log = new AppLog(_logsDir, "tray");
+        _history = new SyncHistoryLog(_logsDir);
         _log.Info($"===== tray start  pid={Environment.ProcessId} user={Environment.UserName} simulate={simulate} config={_configPath}");
         AppLog.Purge(_logsDir, ini.GetInt("general", "log_retention_days", 14));
 
@@ -167,6 +172,36 @@ public sealed class TrayApp : IDisposable
 
 
     /// <summary>
+    /// Drop a collector error that the cloud check has since DISPROVED.
+    ///
+    /// OneNote does not reliably emit a success event after it recovers from a real-time upload error
+    /// (observed: ErrOutOfSyncWithStore, then no further Storage telemetry for that section at all), so an
+    /// error raised from telemetry alone can stand forever even though the content is safely in OneDrive.
+    /// The cloud check is an independent source that can prove it: if OneDrive holds content for that
+    /// section stamped later than the failure, the failure is over.
+    ///
+    /// This is still fail-closed — it removes an error only on positive proof from the server. No Graph,
+    /// no stale poll, no section name, or no server movement all mean the error stays.
+    /// </summary>
+    private bool KeepAfterCloudCheck(SyncIssue issue)
+    {
+        if (_graph is null || issue.SectionName is null) return true;
+        if (issue.Kind is IssueKind.UploadStuck or IssueKind.DownloadStuck) return true;  // the cloud check owns these
+        if (!_graph.CloudConfirmedAfter(issue.NotebookName, issue.SectionName, issue.LastSeen)) return true;
+
+        if (_cloudCleared.Add(issue.DedupeKey))
+        {
+            _log.Info($"cleared by cloud check: {issue.Location} — OneDrive holds content newer than the "
+                    + $"failure at {issue.LastSeen.ToLocalTime():HH:mm:ss}, so the change did reach the server");
+            // the history must not end on "FAILED" for a section that recovered
+            _history.Append($"{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss zzz}  {issue.Location}  RECOVERED  "
+                          + $"cloud check confirms OneDrive has this section's content (failure at "
+                          + $"{issue.LastSeen.ToLocalTime():HH:mm:ss} is resolved)");
+        }
+        return false;
+    }
+
+    /// <summary>
     /// Tray-side fail-closed checks. Anything that stops the watcher from SEEING becomes a visible
     /// issue — the app must never look healthy while it is blind.
     /// </summary>
@@ -223,7 +258,7 @@ public sealed class TrayApp : IDisposable
 
         var list = new List<SyncIssue>();
         if (_simulate) list.Add(SimulatedIssue());
-        if (_status is not null) list.AddRange(_status.ActiveIssues);
+        if (_status is not null) list.AddRange(_status.ActiveIssues.Where(KeepAfterCloudCheck));
         lock (_localIssues) list.AddRange(_localIssues.Values);
         list.AddRange(HealthChecks());
         var collectorFresh = _status is not null && DateTimeOffset.UtcNow - _status.UpdatedUtc < TimeSpan.FromMinutes(2);

@@ -231,6 +231,29 @@ Error fields are absent when there is no error (`Error_Code` key missing ⇒ suc
 as `0x{Error_Code:X8}`; `0xE000xxxx` are OneNote store errors, `0xE40xxxxx` service errors (see the
 Microsoft "Fix issues when you can't sync OneNote" article for the public mapping).
 
+## 5b. Section and notebook identifiers across event kinds (verified)
+
+Decoded from real payloads on 2026-09-06. This matters because errors are matched to the successes
+that clear them by these identifiers — if two event kinds spelled the same section differently, an
+error could never be cleared.
+
+| Event | Section field | Notebook field |
+|---|---|---|
+| `Storage.SectionSyncResult` | `Data.SectionResourceId_ResourceId` = `36B934175DC7E3A4!s8d49…` | `Data.NotebookId_ResourceId` = `36B934175DC7E3A4!626` |
+| `Storage.RealTime.NoteItService` | `Data.SectionId_ResourceId` = `36B934175DC7E3A4!s7720…` | `Data.NotebookId_ResourceId` = `36B934175DC7E3A4!626` |
+| `Storage.NotebookSyncResult` | — | `Data.NotebookId_ResourceId`, plus `Data.Gosid` = `{GUID}{1}` |
+
+**Confirmed: section sync and the real-time channel use the identical `!s<hex32>` resource-id
+spelling**, so `section:` and `section-rt:` scope keys line up between them and coverage works. Do not
+"fix" this by normalising ids without re-checking — the field *names* differ
+(`SectionResourceId_ResourceId` vs `SectionId_ResourceId`) even though the values match.
+
+Other spellings seen for the same section, all present as keys in `section-names.json`: the bare
+`<hex32>` token, and the `0-`/`0|` prefixed `FileIdentifier` form. `SectionNameMap` indexes every one.
+
+`NotebookSyncResult` also carries `IsSectionErrorSuppressed` / `IsSectionErrorUnexpected`, which is the
+evidence that a notebook sync can report success while its sections failed — see `docs/fail-closed.md`.
+
 ## 6. Process presence
 
 `ONENOTE.EXE` (`C:\Program Files\Microsoft Office\root\Office16\ONENOTE.EXE`). Presence gates the

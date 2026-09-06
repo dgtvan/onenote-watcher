@@ -224,6 +224,11 @@ public sealed class EtwSyncDetector
                                 issue = issue with { FirstSeen = prev.Issue.FirstSeen, Occurrences = prev.Issue.Occurrences + 1 };
                             _active[scopeKey] = new ActiveEntry(issue, scopeKey, sectionRid, t);
                             changed = true;
+                            // Put the notebook on the board even though this is a failure. Previously
+                            // _notebooks was written only on success, so a notebook whose only event was
+                            // an error vanished from the NOTEBOOKS table — a fail-closed app hiding the
+                            // very thing it exists to show.
+                            TouchNotebook(ev, names, t);
                             var where = issue.Location.Length > 0 ? issue.Location : "<" + ev.EventName + ">";
                             _log?.Warn($"ISSUE {where}  {issue.Code} {issue.Message}  [{issue.Category}] x{issue.Occurrences}  ({ev.Outcome}: {ev.ClassificationReason})");
                         }
@@ -236,10 +241,7 @@ public sealed class EtwSyncDetector
                     if (ev.IsSyncActivity)
                     {
                         _lastActivity = t; changed = true;
-                        var key = names.Notebook ?? ev.NotebookGosid ?? ev.NotebookResourceId ?? "?";
-                        var prevNb = _notebooks.GetValueOrDefault(key);
-                        _notebooks[key] = new NotebookStatus(names.Notebook ?? key, ev.NotebookGosid ?? prevNb?.Gosid, t,
-                            true, null, null, names.NotebookDisplayName ?? prevNb?.DisplayName);
+                        TouchNotebook(ev, names, t);
                     }
                 }
             }
@@ -299,6 +301,25 @@ public sealed class EtwSyncDetector
         return _active.Remove(key);
     }
 
+    /// <summary>Notebook key used by the status table — the resolved name when we have one.</summary>
+    private static string NotebookKeyOf(SyncEvent ev, ResolvedNames names) =>
+        names.Notebook ?? ev.NotebookGosid ?? ev.NotebookResourceId ?? "?";
+
+    /// <summary>
+    /// Record that we saw activity for this event's notebook. Called for successes AND failures: the
+    /// table stores last-known activity, and whether the notebook is currently healthy is decided at
+    /// publish time from the live issue set (see <see cref="Snapshot"/>), so it can never go stale.
+    /// </summary>
+    private void TouchNotebook(SyncEvent ev, ResolvedNames names, DateTimeOffset t)
+    {
+        var key = NotebookKeyOf(ev, names);
+        if (key == "?") return;
+        var prev = _notebooks.GetValueOrDefault(key);
+        var last = prev?.LastSyncUtc is { } p && p > t ? p : t;
+        _notebooks[key] = new NotebookStatus(names.Notebook ?? key, ev.NotebookGosid ?? prev?.Gosid, last,
+            true, null, null, names.NotebookDisplayName ?? prev?.DisplayName);
+    }
+
     public WatcherStatus Snapshot()
     {
         lock (_gate)
@@ -316,12 +337,38 @@ public sealed class EtwSyncDetector
                 InternetAvailable = _internet,
                 LastSyncEventUtc = _lastActivity,
                 LastTelemetryUtc = _lastMessageAt,
-                Notebooks = _notebooks.Values.OrderBy(n => n.Name).ToList(),
+                Notebooks = PublishNotebooks(),
                 ActiveIssues = _active.Values.Select(v => v.Issue).ToList(),
                 EventsLost = EventsLost,
                 MalformedPayloads = MalformedPayloads,
             };
         }
+    }
+
+    /// <summary>
+    /// The notebook table as published. A notebook carrying an open issue is reported FAILED with that
+    /// issue's code and message; only a notebook with nothing outstanding reads OK. Derived rather than
+    /// stored so the table can never disagree with the PROBLEMS list. A notebook that has only ever
+    /// failed still gets a row.
+    /// </summary>
+    private List<NotebookStatus> PublishNotebooks()
+    {
+        var failures = new Dictionary<string, SyncIssue>(StringComparer.OrdinalIgnoreCase);
+        foreach (var e in _active.Values)
+        {
+            var nb = e.Issue.NotebookName;
+            if (nb is null) continue;
+            if (!failures.TryGetValue(nb, out var prev) || e.Issue.LastSeen > prev.LastSeen) failures[nb] = e.Issue;
+        }
+
+        var rows = _notebooks.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase);
+        foreach (var (nb, issue) in failures)
+        {
+            var prev = rows.GetValueOrDefault(nb);
+            rows[nb] = new NotebookStatus(prev?.Name ?? nb, prev?.Gosid, prev?.LastSyncUtc ?? issue.LastSeen,
+                false, issue.Code, issue.Message, prev?.DisplayName ?? issue.NotebookDisplayName);
+        }
+        return rows.Values.OrderBy(n => n.Name, StringComparer.OrdinalIgnoreCase).ToList();
     }
 
     public IReadOnlyCollection<SyncIssue> ActiveIssues()
