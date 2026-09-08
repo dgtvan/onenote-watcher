@@ -25,11 +25,23 @@ public sealed class SectionNameMap
         return m;
     }
 
-    /// <summary>Candidate keys: the Graph id and its hex tokens, the section-id GUID, the .one file name.</summary>
+    /// <summary>Prefix for the canonical <see cref="SectionKey"/> entry, so it cannot collide with a raw id.</summary>
+    private const string CanonPrefix = "key:";
+
+    /// <summary>Candidate keys: the Graph id, its canonical key, its hex tokens, the section-id GUID, the .one file name.</summary>
     internal static IEnumerable<string> KeysOf(GraphSection s)
     {
         yield return s.Id;
-        foreach (Match t in Regex.Matches(s.Id, "[0-9a-fA-F]{16,}")) yield return t.Value;
+        if (Model.SectionKey.Normalize(s.Id) is { } canon) yield return CanonPrefix + canon;
+        foreach (Match t in Regex.Matches(s.Id, "[0-9a-fA-F]{16,}"))
+        {
+            // Never key on the DRIVE id — the token immediately before "!". It is identical for every
+            // section in the drive, so all of them write that one entry and the last one wins; a lookup
+            // then returns a confidently wrong section name. On this machine 16 sections shared a single
+            // drive id, so the collision was the normal case, not an edge one.
+            var isDriveId = t.Index + t.Length < s.Id.Length && s.Id[t.Index + t.Length] == '!';
+            if (!isDriveId) yield return t.Value;
+        }
         var g = Regex.Match(s.ClientUrl ?? "", @"section-id=\{?([0-9a-fA-F-]{36})\}?", RegexOptions.IgnoreCase);
         if (g.Success) yield return "{" + g.Groups[1].Value.ToUpperInvariant() + "}";
         if (s.WebUrl is not null)
@@ -45,10 +57,26 @@ public sealed class SectionNameMap
         if (resourceId is not null)
         {
             if (_byKey.TryGetValue(resourceId, out var n)) return n;
-            var tok = resourceId.Split('!')[^1].TrimStart('s', 'S');
-            if (tok.Length >= 16)
-                foreach (var kv in _byKey)
-                    if (kv.Key.Contains(tok, StringComparison.OrdinalIgnoreCase)) return kv.Value;
+            // canonical match: one key for every spelling of the same section, so a sync event's
+            // "36B934175DC7E3A4!1242" finds the name stored under Graph's "0-36B934175DC7E3A4!1242"
+            if (Model.SectionKey.Normalize(resourceId) is { } canon
+                && _byKey.TryGetValue(CanonPrefix + canon, out var nc)) return nc;
+            // Substring fallback, for a spelling neither exact nor canonical matching caught. Two guards,
+            // both learned from the same failure: the token must be the ITEM part (after "!"), because a
+            // bare drive id is a substring of every section id in that drive; and it must identify
+            // exactly ONE section, or this returns whichever entry the dictionary happened to yield
+            // first — a confidently wrong name, which is worse than no name at all.
+            var bang = resourceId.LastIndexOf('!');
+            if (bang >= 0)
+            {
+                var tok = resourceId[(bang + 1)..].TrimStart('s', 'S');
+                if (tok.Length >= 16)
+                {
+                    var hits = _byKey.Where(kv => kv.Key.Contains(tok, StringComparison.OrdinalIgnoreCase))
+                                     .Select(kv => kv.Value).Distinct(StringComparer.Ordinal).Take(2).ToList();
+                    if (hits.Count == 1) return hits[0];
+                }
+            }
         }
         if (sectionGosid is not null)
         {

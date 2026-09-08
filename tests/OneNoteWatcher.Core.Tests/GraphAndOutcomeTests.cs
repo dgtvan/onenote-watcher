@@ -27,6 +27,34 @@ public class SectionNameMapTests
     }
 
     [Fact]
+    public void A_section_with_a_numeric_item_id_resolves_from_a_sync_events_spelling()
+    {
+        // "0-<drive>!<number>" — the shape the old lookup could not match, so the history showed the raw
+        // id ("Note / …DC7E3A4!1242") instead of the section name
+        var snap = new GraphSnapshot(DateTimeOffset.UtcNow,
+            [new GraphNotebook("nb1", "Note", null)],
+            [new GraphSection("0-36B934175DC7E3A4!1242", "Family", null, "nb1", "Note", null, null)]);
+
+        Assert.Equal("Note / Family", SectionNameMap.FromSnapshot(snap).Lookup("36B934175DC7E3A4!1242", null));
+    }
+
+    [Fact]
+    public void The_shared_drive_id_is_never_a_key_so_sections_cannot_be_confused()
+    {
+        // every section in a drive repeats the same drive id; keying on it made them overwrite one
+        // another, and a lookup then returned a confidently wrong name
+        var snap = new GraphSnapshot(DateTimeOffset.UtcNow,
+            [new GraphNotebook("nb1", "Note", null)],
+            [new GraphSection("0-36B934175DC7E3A4!1242", "Family", null, "nb1", "Note", null, null),
+             new GraphSection("0-36B934175DC7E3A4!943", "Random", null, "nb1", "Note", null, null)]);
+        var map = SectionNameMap.FromSnapshot(snap);
+
+        Assert.Null(map.Lookup("36B934175DC7E3A4", null));                    // ambiguous → no answer
+        Assert.Equal("Note / Family", map.Lookup("36B934175DC7E3A4!1242", null));
+        Assert.Equal("Note / Random", map.Lookup("36B934175DC7E3A4!943", null));
+    }
+
+    [Fact]
     public void Round_trips_through_file()
     {
         var path = Path.Combine(Path.GetTempPath(), "onwatch_secmap_" + Guid.NewGuid().ToString("N") + ".json");

@@ -253,6 +253,17 @@ spelling**, so `section:` and `section-rt:` scope keys line up between them and 
 Other spellings seen for the same section, all present as keys in `section-names.json`: the bare
 `<hex32>` token, and the `0-`/`0|` prefixed `FileIdentifier` form. `SectionNameMap` indexes every one.
 
+**Not every section uses the `!s<hex32>` form.** Some carry a short numeric OneDrive item id instead —
+`36B934175DC7E3A4!1242` in sync events, `0-36B934175DC7E3A4!1242` in Graph — and on 2026-09-08 that was
+16 of 72 sections here, i.e. routine rather than exotic. Both `SectionKey` and `SectionNameMap` handle
+it, keyed on `<drive>!<item>` together.
+
+**Never key on the drive id alone** (`36B934175DC7E3A4`, the part before `!`). It is identical for every
+section in the drive, so it merges all of them and a lookup returns a confidently wrong name. Two places
+had to learn this: `SectionNameMap.KeysOf` emitted it as a key, and `Lookup`'s substring fallback matched
+it as a token. The fallback now requires an item token and a unique hit — where it once returned whichever
+entry the dictionary yielded first, it now returns nothing, because no name beats a wrong name.
+
 `NotebookSyncResult` also carries `IsSectionErrorSuppressed` / `IsSectionErrorUnexpected`, which is the
 evidence that a notebook sync can report success while its sections failed — see `docs/fail-closed.md`.
 

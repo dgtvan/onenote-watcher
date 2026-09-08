@@ -21,10 +21,22 @@ public static class SyncEventJson
     private const string OneNoteMarker = "\"Office.OneNote.";
     private const string StoragePrefix = "Office.OneNote.Storage.";
 
+    /// <summary>Cap on the payload kept for an unclassified event — enough to classify it, bounded.</summary>
+    private const int MaxRawPayload = 2000;
+
     /// <summary>Words in an event NAME that mean "something went wrong" even with no error field.</summary>
     private static readonly Regex FailureWordsInName = new(
         "Fail|Error|Blocker|Blocked|Stuck|Corrupt|ReadOnly|Conflict|Denied|Unauthori|Expired|Rejected|Abort|Crash|Inconsistenc",
         RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// Names where a failure word does NOT describe a failure. A "request blocker" is OneNote's
+    /// internal blocking-wait handle — instantiating one means a caller is waiting for a download,
+    /// not that sync is blocked. Observed 2026-09-06: FdoDownloadRequestBlockerInstantiated fired
+    /// between a healthy PAGE-SESSION and a healthy REALTIME on the same section, in the same second.
+    /// Deliberately narrow: a plain "…SyncBlockerInstantiated" is still treated as a failure signal.
+    /// </summary>
+    private static readonly Regex FailureWordExceptions = new("RequestBlocker", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     /// <summary>Field names that carry an explicit success flag.</summary>
     private static readonly string[] SuccessFields = ["Data.Success", "Data.IsSuccess", "Data.Succeeded", "Data.WasSuccessful"];
@@ -34,6 +46,12 @@ public static class SyncEventJson
 
     /// <summary>An 8-digit hex code embedded in free-text error output, e.g. "(0xE000002E)".</summary>
     private static readonly Regex EmbeddedHexCode = new(@"0x([0-9A-Fa-f]{8})(?![0-9A-Fa-f])", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Field-name pattern for the HTTP status of a service call. Only names that say "Http" outright —
+    /// a bare "Status"/"StatusCode" is used for too many non-HTTP things to read as an outcome.
+    /// </summary>
+    private static readonly Regex HttpStatusField = new(@"^Data\.Http(Status|StatusCode|ResponseCode)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
     /// <summary>Field-name pattern for error text.</summary>
     private static readonly Regex ErrorTextField = new(@"^Data\.(Error|Error_Description|Error_Type|OperationWithError|FailureReason|ErrorMessage)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
@@ -55,6 +73,39 @@ public static class SyncEventJson
         ["Office.OneNote.Storage.PageSyncSession"] = "per-page timing metric",
         // Connectivity transition; handled as its own signal, not an outcome.
         ["Office.OneNote.Storage.ConnectivityChanged"] = "connectivity transition",
+    };
+
+    /// <summary>
+    /// Known telemetry that reports no outcome of its own — benign UNLESS the payload itself carries
+    /// error evidence.
+    ///
+    /// This is NOT <see cref="DiagnosticEvents"/>, and the difference is the whole point: that table is
+    /// consulted BEFORE the error checks (SyncScore reports errors it skipped, so its codes must not be
+    /// read as a failed sync), which means anything listed there has its error fields swallowed. These
+    /// events have no such exemption — the lookup happens AFTER the error checks, so a genuinely failed
+    /// attachment download still surfaces as a failure with its code.
+    ///
+    /// "FDO" = File Data Object: an embedded or attached file (inserted file, image, printout, recording)
+    /// stored apart from the page XML and fetched over the same Cobalt/FSSHTTP protocol as page content.
+    /// All five were observed 2026-09-06 23:01, each one bracketed by a healthy PAGE-SESSION and a healthy
+    /// REALTIME on the same section within the same second, and none carried an error code, error text or
+    /// a success flag — see docs/fail-closed.md.
+    /// </summary>
+    private static readonly Dictionary<string, string> BenignUnlessError = new(StringComparer.Ordinal)
+    {
+        ["Office.OneNote.Storage.RealTime.FileDataObjectDownload"] = "an embedded-file (attachment) download, reported without an outcome",
+        ["Office.OneNote.Storage.RealTime.DownloadFdoViaCobalt"] = "an embedded-file download over Cobalt/FSSHTTP, reported without an outcome",
+        ["Office.OneNote.Storage.RealTime.DownloadFdoStats"] = "timing/size statistics for an embedded-file download",
+        ["Office.OneNote.Storage.RealTime.FdoDownloadRequestBlockerInstantiated"] = "an internal blocking-wait handle for an embedded-file download was created — not a sync blocker",
+        ["Office.OneNote.Storage.RealTime.DoesNotebookSatisfyNoteItPrerequisites"] = "a capability check asking whether the notebook can use the real-time channel",
+        // OneNote's startup sync gate. Evidence (2026-09-06 08:25, 2026-09-06 11:58, 2026-09-08 10:20):
+        // it fires exactly ONCE per OneNote launch, one second after the connectivity ONLINE events, and
+        // is followed within 0-2 s by a successful PAGE-DOWNLOAD and then a clean session. Its payload —
+        // captured by the UNCLASSIFIED PAYLOAD log — carries NO Data.* fields whatsoever: no notebook, no
+        // section, no code, no reason. An event that cannot say what is blocked, contradicted every time
+        // by content moving seconds later, is the sync engine being constructed, not a sync failure.
+        // A real blockage still surfaces: it would come through the Storage events that carry identity.
+        ["Office.OneNote.Storage.RealTime.SyncBlockerInstantiated"] = "OneNote's startup sync gate being constructed (no payload, always followed by successful sync)",
     };
 
     /// <summary>Cheap ETW hot-path pre-filter: any OneNote SendEvent. (≈640 Office events/s, few are OneNote.)</summary>
@@ -101,6 +152,7 @@ public static class SyncEventJson
                     Outcome = SyncOutcome.Unknown,
                     Time = DateTimeOffset.UtcNow,
                     ClassificationReason = "the payload could not be parsed, so success cannot be confirmed",
+                    RawPayload = json.Length <= MaxRawPayload ? json : json[..MaxRawPayload] + "…(truncated)",
                 };
             }
             return null;
@@ -121,7 +173,7 @@ public static class SyncEventJson
                 if (root.TryGetProperty(f, out var se) && se.ValueKind is JsonValueKind.True or JsonValueKind.False)
                 { success = se.GetBoolean(); break; }
 
-            uint code = 0; string? errorText = null, errorType = null;
+            uint code = 0; string? errorText = null, errorType = null; int? httpStatus = null;
             // an error field that explicitly says "No error" is POSITIVE evidence of success
             var sawExplicitNoError = false;
             var errorFields = new Dictionary<string, string>(StringComparer.Ordinal);
@@ -132,6 +184,11 @@ public static class SyncEventJson
                 {
                     var v = AsUInt(p.Value);
                     if (v != 0) { if (code == 0) code = v; errorFields[p.Name] = v.ToString(); }
+                }
+                else if (HttpStatusField.IsMatch(p.Name))
+                {
+                    var v = AsUInt(p.Value);
+                    if (v != 0) { httpStatus = (int)v; errorFields[p.Name] = v.ToString(); }
                 }
                 else if (ErrorTextField.IsMatch(p.Name) && p.Value.ValueKind == JsonValueKind.String)
                 {
@@ -167,8 +224,20 @@ public static class SyncEventJson
                 errorText = errorText is null ? op
                     : errorText.StartsWith(op, StringComparison.Ordinal) ? errorText : $"{op}: {errorText}";
 
+            // An HTTP status IS an outcome, and ignoring it was a real gap: on 2026-09-08 a
+            // GetUserTypesRequestFailed arrived carrying Data.HttpStatus 503 and was reported as
+            // "indicates a problem, but without a definite outcome" — while the definite outcome sat
+            // unread in the payload. A failing status supplies the error text when nothing else did;
+            // a 2xx/3xx is positive proof the call succeeded.
+            if (httpStatus >= 400) errorText ??= $"HTTP {httpStatus}";
+            else if (httpStatus is >= 200 and < 400) sawExplicitNoError = true;
+
             var transient = root.TryGetProperty("Data.IsErrorTransient", out var tr) && tr.ValueKind == JsonValueKind.True;
-            var nameSignalsFailure = FailureWordsInName.IsMatch(name[(name.LastIndexOf('.') + 1)..]);
+            // 5xx is the server's own "try again"; 408/429 are timeout and throttling. All are retryable
+            // by definition, so they escalate through [transient] rather than shouting on first sight.
+            transient |= httpStatus is >= 500 or 408 or 429;
+            var leaf = name[(name.LastIndexOf('.') + 1)..];
+            var nameSignalsFailure = FailureWordsInName.IsMatch(leaf) && !FailureWordExceptions.IsMatch(leaf);
             var hasErrorEvidence = code != 0 || errorText is not null;
 
             // ---- scope: Storage.* always; other OneNote.* only when it signals failure ----
@@ -198,6 +267,13 @@ public static class SyncEventJson
                 Kind = kind,
                 Outcome = outcome,
                 ClassificationReason = reason,
+                // Fail-closed asks the user to REPORT an event it could not classify, so the payload has
+                // to travel with it: while OneNote runs it holds its diagnostic log with an exclusive
+                // lock, so by the time anyone reads the warning the evidence is unreachable. Kept only
+                // for the events that actually need reporting, so classified traffic costs nothing.
+                RawPayload = outcome is SyncOutcome.Unknown or SyncOutcome.SuspectedFailure
+                    ? json.Length <= MaxRawPayload ? json : json[..MaxRawPayload] + "…(truncated)"
+                    : null,
                 Time = GetTime(root, "Time"),
                 Success = success,
                 ErrorCode = code,
@@ -220,10 +296,13 @@ public static class SyncEventJson
 
     /// <summary>
     /// The fail-closed decision table. ORDER MATTERS:
-    /// specific evidence → documented exceptions → explicit failure → failure signals → success → Unknown.
-    /// The exception lookup sits above generic error evidence so a scan event that merely *reports* an
-    /// error it skipped (SyncScore) is not mistaken for a failed sync — while a page that actually spent
-    /// time in an error state is caught first and still surfaces.
+    /// specific evidence → error-bearing exceptions → explicit failure → non-outcome telemetry →
+    /// failure signals → success → Unknown.
+    /// The <see cref="DiagnosticEvents"/> lookup sits above generic error evidence so a scan event that
+    /// merely *reports* an error it skipped (SyncScore) is not mistaken for a failed sync — while a page
+    /// that actually spent time in an error state is caught first and still surfaces.
+    /// <see cref="BenignUnlessError"/> sits below it instead, so listing an event there silences its
+    /// routine chatter without also silencing a failure it reports.
     /// </summary>
     private static (SyncOutcome, string) Classify(
         string name, SyncEventKind kind, bool? success, uint code, string? errorText,
@@ -251,11 +330,16 @@ public static class SyncEventJson
                 : (SyncOutcome.Failure, $"OneNote reported {what}");
         }
 
-        // 4. a failure signal in the name, with no outcome fields to confirm it
+        // 4. known non-outcome telemetry that brought no error evidence with it. Below the error checks
+        //    on purpose: being on this list buys silence only for a payload that reported nothing wrong.
+        if (BenignUnlessError.TryGetValue(name, out var benign))
+            return (SyncOutcome.Diagnostic, benign);
+
+        // 5. a failure signal in the name, with no outcome fields to confirm it
         if (nameSignalsFailure)
             return (SyncOutcome.SuspectedFailure, $"the event name '{name}' indicates a problem");
 
-        // 5. positive success evidence
+        // 6. positive success evidence
         if (success == true)
             return (SyncOutcome.Success, "OneNote reported success");
         if (sawExplicitNoError)
@@ -263,7 +347,7 @@ public static class SyncEventJson
         if (kind is SyncEventKind.PageUpload or SyncEventKind.PageDownload)
             return (SyncOutcome.Success, "a page transfer completed");
 
-        // 6. FAIL-CLOSED: no positive success signal and no known-benign classification
+        // 7. FAIL-CLOSED: no positive success signal and no known-benign classification
         return (SyncOutcome.Unknown,
             kind == SyncEventKind.UnrecognisedStorage
                 ? $"'{name}' is not known to this build and carries no success flag"

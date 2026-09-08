@@ -38,14 +38,34 @@ public class FailClosedTests
         var e = Parse("""{"EventName":"Office.OneNote.Storage.BrandNewSyncStep","Data.Error_Code":3758096686,"Data.Error_Description":"jerrcFileNodeFileCorrupt"}""");
         Assert.Equal(SyncOutcome.Failure, e.Outcome);
         var issue = SyncEventMapper.ToIssue(e, "etw")!;
-        Assert.Null(issue.ExpiresUtc);   // a confirmed failure never self-clears; only a real success clears it
         Assert.Equal("0xE000012E", issue.Code);
-        Assert.Null(issue.ExpiresUtc);             // a confirmed failure clears only on real success
+    }
+
+    [Fact]
+    public void A_confirmed_failure_clears_only_on_success_unless_no_success_could_ever_reach_it()
+    {
+        // A located failure is held until proof: SyncScope keys it by section, and a section success
+        // covers it. No TTL — the error waits for evidence.
+        var located = Parse("""{"EventName":"Office.OneNote.Storage.SectionSyncResult","Data.Success":false,"Data.Error_Code":3758096477,"Data.SectionResourceId_ResourceId":"x!s1"}""");
+        Assert.Null(SyncEventMapper.ToIssue(located, "etw")!.ExpiresUtc);
+
+        // An UNRECOGNISED event is keyed by event NAME, and CoveredBy never returns an event key — so
+        // no success in the system can ever clear it. Without a TTL that is not "held pending proof",
+        // it is stuck red forever. Time is its only exit, so it gets one.
+        var unclearable = Parse("""{"EventName":"Office.OneNote.Storage.BrandNewSyncStep","Data.Error_Code":3758096686}""");
+        Assert.Equal(SyncOutcome.Failure, unclearable.Outcome);
+        Assert.NotNull(SyncEventMapper.ToIssue(unclearable, "etw")!.ExpiresUtc);
+
+        // …and it is not a way to go quiet on a problem that is still happening: every recurrence
+        // re-arms the TTL from the new event's time.
+        var t0 = DateTimeOffset.UtcNow;
+        var later = SyncEventMapper.ToIssue(unclearable with { Time = t0.AddHours(5) }, "etw")!;
+        Assert.True(later.ExpiresUtc > t0 + SyncEventMapper.SuspectedIssueTtl);
     }
 
     [Theory]
     // real events this machine emits that the previous build dropped entirely
-    [InlineData("""{"EventName":"Office.OneNote.Storage.RealTime.SyncBlockerInstantiated"}""")]
+    [InlineData("""{"EventName":"Office.OneNote.Storage.RealTime.ContentSyncBlockerInstantiated"}""")]
     [InlineData("""{"EventName":"Office.OneNote.UserInfoService.GetUserTypesRequestFailed"}""")]
     // plausible future ones
     [InlineData("""{"EventName":"Office.OneNote.Storage.UploadBlockedByPolicy"}""")]
@@ -181,6 +201,152 @@ public class FailClosedTests
         Assert.Contains("background replication scan", e.ClassificationReason);
     }
 
+    // ---------- known non-outcome telemetry: benign, but only while it reports nothing wrong ----------
+
+    [Theory]
+    [InlineData("Office.OneNote.Storage.RealTime.FileDataObjectDownload")]
+    [InlineData("Office.OneNote.Storage.RealTime.DownloadFdoViaCobalt")]
+    [InlineData("Office.OneNote.Storage.RealTime.DownloadFdoStats")]
+    [InlineData("Office.OneNote.Storage.RealTime.FdoDownloadRequestBlockerInstantiated")]
+    [InlineData("Office.OneNote.Storage.RealTime.DoesNotebookSatisfyNoteItPrerequisites")]
+    public void Attachment_download_chatter_is_not_a_sync_failure(string name)
+    {
+        // Reported 2026-09-06 23:01: opening pages with attachments produced five unknown event names
+        // and pinned the tray red for the 6 h TTL, while the same sections logged REALTIME OK in the
+        // same second. Each carries no success flag and no error field — it reports no outcome at all.
+        var e = Parse($$"""{"EventName":"{{name}}","Time":"2026-09-06T16:01:27Z"}""");
+        Assert.Equal(SyncOutcome.Diagnostic, e.Outcome);
+        Assert.False(e.IsProblem);
+        Assert.Null(SyncEventMapper.ToIssue(e, "etw"));
+    }
+
+    [Theory]
+    [InlineData("Office.OneNote.Storage.RealTime.FileDataObjectDownload")]
+    [InlineData("Office.OneNote.Storage.RealTime.DownloadFdoViaCobalt")]
+    [InlineData("Office.OneNote.Storage.RealTime.DownloadFdoStats")]
+    [InlineData("Office.OneNote.Storage.RealTime.FdoDownloadRequestBlockerInstantiated")]
+    [InlineData("Office.OneNote.Storage.RealTime.DoesNotebookSatisfyNoteItPrerequisites")]
+    public void But_the_same_event_reporting_a_real_error_is_still_a_failure(string name)
+    {
+        // the whole reason these live below the error checks and not in DiagnosticEvents: an attachment
+        // that genuinely fails to download must still reach the user, with its code
+        var e = Parse($$"""{"EventName":"{{name}}","Data.Error_Code":3758096477}""");
+        Assert.Equal(SyncOutcome.Failure, e.Outcome);
+        Assert.True(e.IsProblem);
+        Assert.Equal("0xE000005D", SyncEventMapper.ToIssue(e, "etw")!.Code);
+    }
+
+    [Fact]
+    public void A_request_blocker_is_a_wait_handle_but_an_unlisted_blocker_is_still_suspect()
+    {
+        // "Blocker" in a name is a failure word, but OneNote also uses it for internal blocking-wait
+        // handles. The exemption is deliberately narrow — only "RequestBlocker". An unrecognised
+        // blocker event still surfaces; only names with evidence behind them are on the benign list.
+        Assert.Equal(SyncOutcome.Unknown,
+            Parse("""{"EventName":"Office.OneNote.Storage.RealTime.SomeFutureRequestBlockerInstantiated"}""").Outcome);
+        Assert.Equal(SyncOutcome.SuspectedFailure,
+            Parse("""{"EventName":"Office.OneNote.Storage.RealTime.ContentSyncBlockerInstantiated"}""").Outcome);
+    }
+
+    [Fact]
+    public void The_startup_sync_gate_is_not_a_sync_failure()
+    {
+        // Observed once per OneNote launch on 2026-09-06 (×2) and 2026-09-08, one second after the
+        // connectivity ONLINE events and 0-2 s before a successful PAGE-DOWNLOAD. The captured payload
+        // carries no Data.* fields at all — it cannot name anything as blocked.
+        // verbatim from the UNCLASSIFIED PAYLOAD log line of 2026-09-08 10:20:42 (token elided),
+        // spaced separators and envelope fields included — the parser must cope with the real shape
+        var e = Parse("""{"EventName": "Office.OneNote.Storage.RealTime.SyncBlockerInstantiated", "Flags": 30962273224818945, "InternalSequenceNumber": 260, "Time": "2026-09-08T03:20:40Z", "AriaTenantToken": "<elided>"}""");
+        Assert.Equal(SyncOutcome.Diagnostic, e.Outcome);
+        Assert.False(e.IsProblem);
+        Assert.Null(SyncEventMapper.ToIssue(e, "etw"));
+    }
+
+    [Fact]
+    public void The_benign_list_outranks_the_failure_word_in_the_name_but_not_real_error_evidence()
+    {
+        // ordering proof: SyncBlockerInstantiated trips the name heuristic, so being on the list has to
+        // win for it to go quiet — and error evidence has to win over the list.
+        Assert.Equal(SyncOutcome.Diagnostic,
+            Parse("""{"EventName":"Office.OneNote.Storage.RealTime.SyncBlockerInstantiated"}""").Outcome);
+        Assert.Equal(SyncOutcome.Failure,
+            Parse("""{"EventName":"Office.OneNote.Storage.RealTime.SyncBlockerInstantiated","Data.Error_Code":3758096477}""").Outcome);
+    }
+
+    // ---------- an HTTP status is an outcome, and must be read as one ----------
+
+    [Fact]
+    public void A_failing_http_status_is_read_as_the_outcome_instead_of_being_guessed_from_the_name()
+    {
+        // 2026-09-08: this arrived with Data.HttpStatus 503 and was reported as "indicates a problem,
+        // but without a definite outcome" — the definite outcome was sitting unread in the payload.
+        // verbatim from the UNCLASSIFIED PAYLOAD log line of 2026-09-08 10:20:47 (token elided)
+        var e = Parse("""{"EventName": "Office.OneNote.UserInfoService.GetUserTypesRequestFailed", "Flags": 30962273224818945, "InternalSequenceNumber": 535, "Time": "2026-09-08T03:20:45Z", "AriaTenantToken": "<elided>", "Data.HttpStatus": 503}""");
+        Assert.Equal(SyncOutcome.Transient, e.Outcome);        // 5xx is the server's own "try again"
+        Assert.Equal("HTTP 503", e.ErrorDescription);
+
+        var issue = SyncEventMapper.ToIssue(e, "etw")!;
+        Assert.Equal(Core.Diagnosis.FailureCategory.Network, issue.Category);
+        Assert.Contains("HttpStatus=503", issue.TechnicalDetail);
+        Assert.NotNull(issue.ExpiresUtc);                      // event-scoped: nothing else could clear it
+        Assert.Equal(new DateTimeOffset(2026, 9, 8, 3, 20, 45, TimeSpan.Zero) + SyncEventMapper.SuspectedIssueTtl,
+            issue.ExpiresUtc);                                 // anchored to the event, not to parse time
+    }
+
+    [Theory]
+    [InlineData(500, true)]
+    [InlineData(503, true)]
+    [InlineData(408, true)]
+    [InlineData(429, true)]
+    [InlineData(404, false)]
+    [InlineData(403, false)]
+    public void Server_side_and_throttling_statuses_are_transient_client_errors_are_not(int status, bool transient)
+    {
+        var e = Parse($$"""{"EventName":"Office.OneNote.Storage.SomeServiceCall","Data.HttpStatus":{{status}}}""");
+        Assert.Equal(transient ? SyncOutcome.Transient : SyncOutcome.Failure, e.Outcome);
+    }
+
+    [Fact]
+    public void A_successful_http_status_is_positive_evidence_not_just_the_absence_of_an_error()
+    {
+        // without this a 200 would fall through to the fail-closed default and be reported as a problem
+        var e = Parse("""{"EventName":"Office.OneNote.Storage.SomeServiceCall","Data.HttpStatus":200}""");
+        Assert.Equal(SyncOutcome.Success, e.Outcome);
+        Assert.False(e.IsProblem);
+    }
+
+    [Fact]
+    public void A_real_error_code_still_outranks_a_healthy_http_status()
+    {
+        var e = Parse("""{"EventName":"Office.OneNote.Storage.SomeServiceCall","Data.HttpStatus":200,"Data.Error_Code":3758096477}""");
+        Assert.Equal(SyncOutcome.Failure, e.Outcome);
+    }
+
+    // ---------- an unclassified event carries the evidence needed to classify it ----------
+
+    [Fact]
+    public void An_unclassified_event_keeps_its_payload_so_the_report_can_be_acted_on()
+    {
+        // OneNote holds its diagnostic log exclusively locked while it runs, so a warning that only
+        // names the event leaves nothing to classify it from once the moment has passed.
+        var e = Parse("""{"EventName":"Office.OneNote.Storage.SomeFutureThing","Data.Whatever":42}""");
+        Assert.Equal(SyncOutcome.Unknown, e.Outcome);
+        Assert.Contains("\"Data.Whatever\":42", e.RawPayload);
+
+        // a malformed payload is the case where the evidence matters most
+        var bad = SyncEventJson.TryParse("""SendEvent {"EventName":"Office.OneNote.Storage.SectionSyncResult","Data.Success":tru""")!;
+        Assert.Contains("Data.Success", bad.RawPayload);
+    }
+
+    [Fact]
+    public void A_classified_event_carries_no_payload()
+    {
+        // only the events that need reporting pay the memory cost
+        Assert.Null(Parse("""{"EventName":"Office.OneNote.Storage.SectionSyncResult","Data.Success":true}""").RawPayload);
+        Assert.Null(Parse("""{"EventName":"Office.OneNote.Storage.SyncScore"}""").RawPayload);
+        Assert.Null(Parse("""{"EventName":"Office.OneNote.Storage.RealTime.DownloadFdoStats"}""").RawPayload);
+    }
+
     // ---------- regression guard against the real event universe ----------
 
     [Theory]
@@ -194,6 +360,12 @@ public class FailClosedTests
     [InlineData("Office.OneNote.Storage.RealTime.NoteItHttpDownload", true)]
     [InlineData("Office.OneNote.Storage.RealTime.NoteItService", true)]
     [InlineData("Office.OneNote.Storage.RealTime.SyncBlockerInstantiated", true)]
+    // observed 2026-09-06 when pages with attachments were opened
+    [InlineData("Office.OneNote.Storage.RealTime.FileDataObjectDownload", true)]
+    [InlineData("Office.OneNote.Storage.RealTime.DownloadFdoViaCobalt", true)]
+    [InlineData("Office.OneNote.Storage.RealTime.DownloadFdoStats", true)]
+    [InlineData("Office.OneNote.Storage.RealTime.FdoDownloadRequestBlockerInstantiated", true)]
+    [InlineData("Office.OneNote.Storage.RealTime.DoesNotebookSatisfyNoteItPrerequisites", true)]
     [InlineData("Office.OneNote.UserInfoService.GetUserTypesRequestFailed", true)]
     [InlineData("Office.OneNote.Storage.AnythingNewMicrosoftAdds", true)]
     [InlineData("Office.OneNote.System.AppLifeCycle.AppLaunch", false)]
@@ -216,7 +388,7 @@ public class FailClosedTests
         string[] problems =
         [
             """{"EventName":"Office.OneNote.Storage.Whatever"}""",
-            """{"EventName":"Office.OneNote.Storage.RealTime.SyncBlockerInstantiated"}""",
+            """{"EventName":"Office.OneNote.Storage.RealTime.ContentSyncBlockerInstantiated"}""",
             """{"EventName":"Office.OneNote.Storage.SectionSyncResult","Data.Success":false}""",
             """{"EventName":"Office.OneNote.Storage.X","Data.Error_Code":3758096477}""",
             """{"EventName":"Office.OneNote.Storage.PageSyncSession","Data.ErrorState_TimeInActiveSyncErrorState":5000}""",
@@ -236,12 +408,12 @@ public class FailClosedTests
     [Fact]
     public void An_unclassified_event_can_be_silenced_by_name_once_judged_benign()
     {
-        var e = Parse("""{"EventName":"Office.OneNote.Storage.RealTime.SyncBlockerInstantiated"}""");
+        var e = Parse("""{"EventName":"Office.OneNote.Storage.RealTime.ContentSyncBlockerInstantiated"}""");
         var issue = SyncEventMapper.ToIssue(e, "etw")!;
-        Assert.Equal("Office.OneNote.Storage.RealTime.SyncBlockerInstantiated", issue.EventName);
+        Assert.Equal("Office.OneNote.Storage.RealTime.ContentSyncBlockerInstantiated", issue.EventName);
 
         Assert.False(IgnoreRules.Empty.IsIgnored(issue));
-        var rules = new IgnoreRules([], [], [], [], [], ["Office.OneNote.Storage.RealTime.SyncBlocker*"]);
+        var rules = new IgnoreRules([], [], [], [], [], ["Office.OneNote.Storage.RealTime.ContentSyncBlocker*"]);
         Assert.True(rules.IsIgnored(issue));
     }
 }

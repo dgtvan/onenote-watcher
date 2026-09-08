@@ -33,6 +33,10 @@ public sealed class EtwSyncDetector
     private readonly NameResolver _names;
     private readonly AppLog? _log;
     private readonly TransientPolicy _transient;
+    /// <summary>The <c>[ignore]</c> rules, so the published notebook table agrees with what the user is
+    /// actually alerted about. Suppressed issues are still raised and still published — only their
+    /// verdict on a notebook's health is withheld.</summary>
+    private readonly IgnoreRules _ignore;
     private readonly Action<WatcherStatus>? _onStatusChanged;
     private readonly Func<bool> _oneNoteRunning;
     /// <summary>Awake-time source; injectable so the sleep rule can be tested against a simulated clock.</summary>
@@ -69,8 +73,9 @@ public sealed class EtwSyncDetector
 
     public EtwSyncDetector(IEtwMessageSource source, SyncHistoryLog history, NameResolver? names = null,
         Action<WatcherStatus>? onStatusChanged = null, Func<bool>? oneNoteRunning = null, AppLog? log = null,
-        TransientPolicy? transient = null, Func<TimeSpan>? awakeClock = null)
+        TransientPolicy? transient = null, Func<TimeSpan>? awakeClock = null, IgnoreRules? ignore = null)
     {
+        _ignore = ignore ?? IgnoreRules.Empty;
         _awakeNow = awakeClock ?? AwakeClock.Stamp;
         _startedAwake = _awakeNow();
         _lastMessageAwake = _startedAwake;
@@ -228,7 +233,13 @@ public sealed class EtwSyncDetector
 
             // an event we have never classified: log it once, loudly, so it can be catalogued
             if (ev.Outcome is SyncOutcome.Unknown or SyncOutcome.SuspectedFailure && _seenUnknownEvents.Add(ev.EventName))
+            {
                 _log?.Warn($"UNCLASSIFIED EVENT '{ev.EventName}' → treated as a possible failure ({ev.ClassificationReason}). Please report it.");
+                // The payload goes with the warning: asking for a report is useless if the evidence
+                // needed to answer it is gone. OneNote keeps its diagnostic log exclusively locked while
+                // it runs, so this line is the only durable copy of what the event actually carried.
+                if (ev.RawPayload is { } raw) _log?.Warn($"UNCLASSIFIED PAYLOAD '{ev.EventName}' {raw}");
+            }
 
             if (ev.Kind == SyncEventKind.ConnectivityChanged)
             {
@@ -409,6 +420,12 @@ public sealed class EtwSyncDetector
     /// issue's code and message; only a notebook with nothing outstanding reads OK. Derived rather than
     /// stored so the table can never disagree with the PROBLEMS list. A notebook that has only ever
     /// failed still gets a row.
+    ///
+    /// An issue silenced by <c>[ignore]</c> does not fail its notebook. The rules were applied only in
+    /// the tray, which decides the icon, so silencing an event left the icon green while this table
+    /// still read FAILED — the two halves of one screen contradicting each other. The issue itself is
+    /// still raised, recorded and published (the tray shows it marked "ignored by config"); what it no
+    /// longer does is condemn a notebook the user has told us not to alert on.
     /// </summary>
     private List<NotebookStatus> PublishNotebooks()
     {
@@ -416,7 +433,7 @@ public sealed class EtwSyncDetector
         foreach (var e in _active.Values)
         {
             var nb = e.Issue.NotebookName;
-            if (nb is null) continue;
+            if (nb is null || _ignore.IsIgnored(e.Issue)) continue;
             if (!failures.TryGetValue(nb, out var prev) || e.Issue.LastSeen > prev.LastSeen) failures[nb] = e.Issue;
         }
 

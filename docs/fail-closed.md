@@ -135,14 +135,23 @@ Implemented in `SyncEventJson.Classify`. **Order matters** — it is evaluated t
 | 1 | `ErrorState_TimeIn*SyncErrorState > 0` — a page really spent time failing | `SuspectedFailure` | error (expires after 6 h) |
 | 2 | Event is a documented non-outcome (see exceptions below) | `Diagnostic` | history only |
 | 3 | `Success`/`IsSuccess`/`Succeeded`/`WasSuccessful` **= false** | `Failure` / `Transient` | error |
-| 4 | Any `*Error_Code`/`*ErrorCode` ≠ 0, or any error-text field with a real message | `Failure` / `Transient` | error |
-| 5 | Event **name** contains Fail/Error/Blocker/Stuck/Corrupt/ReadOnly/Conflict/Denied/Unauthori/Expired/Rejected/Abort/Crash/Inconsistenc | `SuspectedFailure` | error (expires after 6 h) |
-| 6 | Success flag **= true** | `Success` | clears the issue |
-| 7 | An error field explicitly says `"No error"` | `Success` | clears the issue |
-| 8 | A page upload/download completed (only emitted on completion) | `Success` | clears the issue |
-| 9 | **anything else** | `Unknown` | error (expires after 6 h) |
+| 4 | Any `*Error_Code`/`*ErrorCode` ≠ 0, or any error-text field with a real message, **or `Data.Http*` status ≥ 400** | `Failure` / `Transient` | error |
+| 5 | Event is known non-outcome telemetry **and reported nothing wrong** (see exceptions below) | `Diagnostic` | history only |
+| 6 | Event **name** contains Fail/Error/Blocker/Stuck/Corrupt/ReadOnly/Conflict/Denied/Unauthori/Expired/Rejected/Abort/Crash/Inconsistenc | `SuspectedFailure` | error (expires after 6 h) |
+| 7 | Success flag **= true** | `Success` | clears the issue |
+| 8 | An error field explicitly says `"No error"`, **or `Data.Http*` status is 2xx/3xx** | `Success` | clears the issue |
+| 9 | A page upload/download completed (only emitted on completion) | `Success` | clears the issue |
+| 10 | **anything else** | `Unknown` | error (expires after 6 h) |
 
-Row 9 is the fail-closed default: a `Office.OneNote.Storage.*` event this build has never seen, or a
+Rows 2 and 5 are both "known non-outcome telemetry", and the gap between them is the point. Row 2
+sits **above** the error checks, so a listed event's error fields are ignored entirely — needed for
+`SyncScore`, which *reports* errors it skipped, but it means anything listed there can never raise an
+alert. Row 5 sits **below** them, so listing an event silences its routine chatter while a failure it
+genuinely reports still surfaces with its code. Row 2 is for events whose error fields are not about
+this sync; row 5 is for events that simply have no outcome to report. **New entries go in row 5**
+unless there is evidence the event's own error fields are misleading.
+
+Row 10 is the fail-closed default: a `Office.OneNote.Storage.*` event this build has never seen, or a
 known event that arrives *without* its success flag, is treated as a possible failure — not as "fine".
 
 ### Scope
@@ -153,6 +162,25 @@ known event that arrives *without* its success flag, is treated as a possible fa
   (AppLaunch, Copilot licence, ConfigServiceReady) stays out.
 - Non-OneNote Office events are out of scope.
 
+### An HTTP status is an outcome
+
+Read from `Data.HttpStatus`, `Data.HttpStatusCode`, `Data.HttpResponseCode` — names that say "Http"
+outright, since a bare `Status`/`StatusCode` is used for too many non-HTTP things to trust.
+
+| Status | Read as |
+|---|---|
+| 2xx / 3xx | positive success evidence (row 8) — without this a healthy 200 would fall through to the fail-closed default and be reported as a problem |
+| 4xx | `Failure`, error text `HTTP <code>` when no other message was supplied |
+| 5xx, 408, 429 | `Transient` — the server's own "try again", plus timeout and throttling |
+
+A real error code still outranks a healthy status.
+
+This closed a gap found on 2026-09-08: `UserInfoService.GetUserTypesRequestFailed` arrived carrying
+`Data.HttpStatus: 503` and was reported as *"indicates a sync problem, but without a definite
+outcome"* — while the definite outcome sat unread in the payload, because `HttpStatus` matched
+neither the error-code nor the error-text pattern. The event was being judged on its **name** while
+its evidence was ignored. It now reports `HTTP 503`, categorised `Network`, as a transient.
+
 ### Field-name independence
 
 Success is read from `Data.Success`, `Data.IsSuccess`, `Data.Succeeded`, `Data.WasSuccessful`.
@@ -161,9 +189,11 @@ Error codes from **any** field matching `Data.*Error_Code` / `Data.*ErrorCode` (
 `Error_Description`, `Error_Type`, `OperationWithError`, `FailureReason`, `ErrorMessage`.
 A value of `""`, `"No error"`, `"None"`, `"OK"`, `"Success"`, `"0"` is treated as *not* an error.
 
-### The two documented exceptions
+### The documented exceptions
 
-Both are deliberate, evidence-backed, and recorded in the history (never silently dropped):
+All are deliberate, evidence-backed, and recorded in the history (never silently dropped).
+
+**Row 2 — error fields are not about this sync** (`DiagnosticEvents`):
 
 | Event | Why it is not an outcome |
 |---|---|
@@ -171,6 +201,48 @@ Both are deliberate, evidence-backed, and recorded in the history (never silentl
 | `Storage.PageSyncSession` | Per-page timing metric. Its `ErrorState_Time*` fields *are* used — row 1 above catches a page that actually spent time in an error state. |
 
 `Storage.ConnectivityChanged` is not an outcome either; it drives a dedicated offline warning.
+
+**Row 5 — no outcome to report, but a reported error still counts** (`BenignUnlessError`):
+
+"FDO" is OneNote's **File Data Object**: an embedded or attached file (inserted file, image,
+printout, recording) stored apart from the page XML and fetched over the same Cobalt/FSSHTTP
+protocol as page content.
+
+| Event | What it actually is |
+|---|---|
+| `Storage.RealTime.FileDataObjectDownload` | An attachment download. |
+| `Storage.RealTime.DownloadFdoViaCobalt` | The same download over Cobalt/FSSHTTP. |
+| `Storage.RealTime.DownloadFdoStats` | Timing/size statistics for it. |
+| `Storage.RealTime.FdoDownloadRequestBlockerInstantiated` | An internal **blocking-wait handle** was created because a caller is waiting for the download. Not a sync blocker. |
+| `Storage.RealTime.DoesNotebookSatisfyNoteItPrerequisites` | A capability check asking whether the notebook can use the real-time channel. A question, not a result. |
+| `Storage.RealTime.SyncBlockerInstantiated` | OneNote's **startup sync gate** being constructed. See the evidence below. |
+
+`SyncBlockerInstantiated` was the last name-signalled unknown, and the payload capture settled it.
+Across three OneNote launches (2026-09-06 08:25, 2026-09-06 11:58, 2026-09-08 10:20) it fired
+**exactly once per launch**, one second after the connectivity `ONLINE` events, and was followed
+within 0–2 seconds by a successful `PAGE-DOWNLOAD` and then a clean session. Its captured payload
+carries **no `Data.*` fields at all** — no notebook, no section, no code, no reason:
+
+```
+{"EventName": "Office.OneNote.Storage.RealTime.SyncBlockerInstantiated", "Flags": 30962273224818945,
+ "InternalSequenceNumber": 260, "Time": "2026-09-08T03:20:40Z", "AriaTenantToken": "…"}
+```
+
+An event that cannot name what is blocked, contradicted every time by content moving seconds later,
+is the sync engine being constructed. A genuine blockage still surfaces — it arrives on the Storage
+events that carry notebook and section identity. Note this is the *listed* name only: an unrecognised
+`…BlockerInstantiated` still surfaces, because the exemption is evidence, not a pattern.
+
+Evidence (2026-09-06 23:01): opening pages with attachments produced these five names for the first
+time. Each one is bracketed in the history by a healthy `PAGE-SESSION OK (0 ms in error state)` and a
+healthy `REALTIME OK` on the same section **within the same second**, and none carried an error code,
+error text or a success flag. Five benign event names pinned the tray red for the full 6 h TTL, and
+because an unrecognised event is scoped `event:<name>` with no location (see the coverage rules), no
+success could ever clear it — it could only expire.
+
+`FdoDownloadRequestBlockerInstantiated` also reached row 6 on the word "Blocker". The name heuristic
+now exempts **`RequestBlocker`** specifically — a blocker attached to a *request* is a wait handle.
+A plain `SyncBlockerInstantiated` is still treated as a failure signal.
 
 ## When an error clears — coverage rules
 
@@ -209,9 +281,21 @@ without that proof.
 | `Failure` (code catalogued as transient, or the real-time channel) | a proven success for the same scope |
 | `Transient` (OneNote flagged it retryable) | a proven success |
 | `SuspectedFailure` / `Unknown` | a proven success, **or 6 h TTL** |
+| **any outcome on an unrecognised / non-Storage event** | **6 h TTL only** — see below |
 
 The TTL exists because an unproven signal may have no clearing event; without it a single odd event
 would stay red forever. A **confirmed** failure has no TTL — it clears only on a real success.
+
+**Except when no success could ever reach it.** `SyncScope` keys an `UnrecognisedStorage` or
+`OtherOneNoteSignal` issue by *event name* (`event:<name>`), and `CoveredBy` never returns an event
+key — so nothing in the system is able to clear one. "No TTL" is meant to say *held until proven
+resolved*; for these it would have said *stuck red forever*, since the proof cannot exist. So they
+carry the TTL whatever their outcome. This was a live trap rather than a theoretical one: any
+unrecognised event arriving with an error code and no notebook id would have pinned the tray red
+permanently, and reading `HttpStatus` as error evidence would have walked the 503 straight into it.
+
+It is not a way to go quiet on a live problem: every recurrence re-arms the TTL from the new event's
+time, so only a problem that genuinely stopped fades.
 
 Only a *proven* success clears an issue, and it must be for the **same scope** (section / notebook /
 event name). A success elsewhere never masks a failure here.
@@ -306,8 +390,16 @@ Deliberately narrow, so it cannot hide a real problem:
 - The success must be **at or after** the local timestamp. An earlier sync proves nothing about a later
   change.
 - Sections are matched on a **canonical key** (`SectionKey`), because the same section appears as
-  `36B934175DC7E3A4!s8d49…`, `0-…`, `0|…` and the bare token depending on the source. A silent
-  match failure would mean an alert that can never be answered.
+  `36B934175DC7E3A4!s8d49…`, `0-…`, `0|…`, the bare token, and `<drive>!<number>` depending on the
+  source. A silent match failure would mean an alert that can never be answered — and on 2026-09-08 it
+  did exactly that. `SectionKey` could not key the `<drive>!<number>` spelling (no `!s` token, and a
+  16-hex drive id where the bare-token rule needs 24+), so it returned null on **both** sides: the
+  collector never recorded the success, and the cloud check could not have matched it if it had.
+  "Van / Family" was reported stuck for 1.2 h, surviving repeated manual syncs, while the history for
+  that very second read `Note / …DC7E3A4!1242  REALTIME  OK`. 16 of that machine's 72 sections use the
+  shape, so the suppression below was dead for 22% of them. The key for that form is **both** parts
+  (`<drive>!<item>`): the drive id alone is shared by every section in the drive, and keying on it
+  would trade a missed match for a wrong one.
 - No collector, a stale status file, or an unmatched section all mean **no suppression**.
 
 Section results are published in `status.json` and reloaded on startup, because a collector restart
@@ -458,19 +550,46 @@ DELIBERATELY OUT OF SCOPE (no failure signal in name or fields):
 Every `Success` above came from an explicit flag, an explicit `"No error"`, or a completed transfer —
 never from an absence of evidence.
 
+## Reporting an unclassified event
+
+When an event reaches row 10 the collector logs it once, loudly, **with its payload**:
+
+```
+WARN  UNCLASSIFIED EVENT 'Office.OneNote.Storage.X' -> treated as a possible failure (...). Please report it.
+WARN  UNCLASSIFIED PAYLOAD 'Office.OneNote.Storage.X' {"EventName":"...","Data....":...}
+```
+
+The payload has to travel with the warning: OneNote holds its diagnostic log under an **exclusive**
+lock for as long as it is running, so by the time anyone reads the warning the evidence behind it is
+unreachable. (This is not hypothetical — it blocked the 2026-09-06 investigation above, which had to
+be settled from surrounding history lines instead.) The payload is kept only for `Unknown` and
+`SuspectedFailure` events, capped at 2000 characters.
+
 ## Known noise, and how to silence it
 
-The two `SuspectedFailure` events above are name-signalled only; whether they are benign is unproven,
-so fail-closed keeps them visible as errors that self-expire after 6 h.
-Once you are satisfied they are harmless:
+Both of the events this section used to name have since been settled by their captured payloads:
+`SyncBlockerInstantiated` is classified as the startup gate, and `GetUserTypesRequestFailed` now
+reports its real `HTTP 503` and expires after 6 h. Neither needs an ignore rule any more.
+
+What remains is any event still judged on its **name** alone. Fail-closed keeps those visible as
+errors that self-expire after 6 h. Once you are satisfied one is harmless:
 
 ```ini
 [ignore]
-events = Office.OneNote.Storage.RealTime.SyncBlockerInstantiated, Office.OneNote.UserInfoService.GetUserTypesRequestFailed
+events = Office.OneNote.Storage.RealTime.SomeEventYouJudgedBenign
 ```
+
+Prefer classifying it in `BenignUnlessError` over ignoring it: an ignore rule is blind and silences
+the event even when it reports a real error, while the list still lets a genuine failure through.
 
 They stay in the sync history either way. This is the deliberate trade: the watcher errs toward
 telling you, and you decide what to mute — rather than the watcher deciding silently for you.
+
+An ignored issue is still raised, still published and still shown in the issues window marked
+*"(ignored by config)"* — what it no longer does is turn the tray red **or mark its notebook FAILED**.
+The rules used to be applied only in the tray, which owns the icon, while the collector derived the
+NOTEBOOKS table from the unfiltered issue set: silencing an event produced a green icon above a
+FAILED row for the same notebook. The collector now reads `[ignore]` for that derivation too.
 
 ## Tests guarding the contract
 
@@ -479,4 +598,7 @@ unknown Storage events → `Unknown` + warning; unknown event *with* an error co
 words in a name; malformed payloads; every alternative success/error field spelling; missing success
 flag; out-of-scope noise staying out; transient escalation and window expiry; SyncScore staying
 diagnostic; TTL expiry; only a same-scope proven success clearing an issue; dropped ETW records;
-and a regression guard listing every event name observed on this machine.
+attachment-download chatter staying diagnostic *while the same event carrying an error code is still
+a failure*; the narrow `RequestBlocker` exemption; the payload kept for an unclassified event; an
+ignored issue not failing its notebook; and a regression guard listing every event name observed on
+this machine.
