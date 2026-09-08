@@ -48,6 +48,14 @@ public sealed record SyncEvent
     /// <summary>Why the classifier reached <see cref="Outcome"/> — shown in logs and issue details.</summary>
     public string? ClassificationReason { get; init; }
 
+    /// <summary>
+    /// The raw payload, kept ONLY for events the classifier could not prove benign
+    /// (<see cref="SyncOutcome.Unknown"/> / <see cref="SyncOutcome.SuspectedFailure"/>), so the
+    /// "please report this event" warning can carry the evidence needed to classify it. OneNote holds
+    /// its diagnostic log exclusively locked while it runs, so this is the only chance to keep it.
+    /// </summary>
+    public string? RawPayload { get; init; }
+
     public string? NotebookGosid { get; init; }
     public string? NotebookResourceId { get; init; }
     public string? SectionResourceId { get; init; }

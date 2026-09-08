@@ -18,6 +18,34 @@ public class SectionKeyTests
         Assert.Equal("8d499fcb43aa42bd9a75d6d555478ac2", SectionKey.Normalize(id));
     }
 
+    [Theory]
+    // A section whose OneDrive item id is a short number instead of an "!s" token. Both spellings of
+    // the SAME section must reduce to one key, or the collector's evidence never meets the cloud check.
+    [InlineData("36B934175DC7E3A4!1242")]        // sync event resource id
+    [InlineData("0-36B934175DC7E3A4!1242")]      // Graph id
+    [InlineData("0|36B934175DC7E3A4!1242")]      // FileIdentifier
+    public void A_numeric_item_id_is_keyed_by_drive_and_item_together(string id)
+    {
+        Assert.Equal("36b934175dc7e3a4!1242", SectionKey.Normalize(id));
+    }
+
+    [Fact]
+    public void Sections_sharing_a_drive_id_are_not_merged_by_the_numeric_form()
+    {
+        // the drive id is identical for every section in the drive — keying on it alone would trade a
+        // missed match for a wrong one, which is worse
+        Assert.False(SectionKey.Same("0-36B934175DC7E3A4!1242", "0-36B934175DC7E3A4!943"));
+        Assert.True(SectionKey.Same("36B934175DC7E3A4!1242", "0-36B934175DC7E3A4!1242"));
+    }
+
+    [Fact]
+    public void The_numeric_rule_never_re_interprets_an_id_the_older_rules_already_key()
+    {
+        // it runs last, so an "!s" id keeps the section token it has always had
+        Assert.Equal("8d499fcb43aa42bd9a75d6d555478ac2",
+            SectionKey.Normalize("0-36B934175DC7E3A4!s8d499fcb43aa42bd9a75d6d555478ac2"));
+    }
+
     [Fact]
     public void Different_sections_do_not_collide()
     {
@@ -104,6 +132,41 @@ public class CollectorOutranksTimestampsTests
         var other = new SectionSyncState(SectionKey.Normalize("36B934175DC7E3A4!s8d499fcb43aa42bd9a75d6d555478ac2")!,
             "Note / eSim Data", _sectionSynced);
         Assert.Single(AfterGrace(Baselined(), [other]));
+    }
+
+    /// <summary>
+    /// Reported 2026-09-08: "Van / Family — a local change at 10:20 has not reached OneDrive after
+    /// 1.2 h", surviving repeated manual syncs, while the history for that exact second read
+    /// "Note / …DC7E3A4!1242  REALTIME  OK" and then a section sync OK.
+    ///
+    /// The suppression above was already correct and simply never ran: this section's id carries a
+    /// numeric item ("!1242") rather than an "!s" token, so SectionKey.Normalize returned null on BOTH
+    /// sides — the collector never recorded the success, and the cloud check could not have matched it
+    /// if it had. 16 of the 72 sections on that machine share the shape, so it was the normal case.
+    /// </summary>
+    [Fact]
+    public void A_section_whose_id_uses_a_numeric_item_is_protected_the_same_way()
+    {
+        const string graphId = "0-36B934175DC7E3A4!1242";
+        const string eventRid = "36B934175DC7E3A4!1242";
+
+        GraphSnapshot server(DateTimeOffset lm) => new(DateTimeOffset.UtcNow,
+            [new GraphNotebook("nb", "Note", lm)],
+            [new GraphSection(graphId, "Family", lm, "nb", "Note", null, null)]);
+        IReadOnlyList<LocalSection> local(DateTimeOffset newest) => [new LocalSection("Van", "Family", newest)];
+
+        var d = new OutcomeDetector(TimeSpan.FromMinutes(10));
+        d.Evaluate(local(_t0), server(_serverStale), true, true, _t0);
+        d.Evaluate(local(_localStamp), server(_serverStale), true, true, _localStamp, null);
+
+        // the collector watched this very section sync at the instant the local stamp moved
+        var observed = SectionKey.Normalize(eventRid);
+        Assert.NotNull(observed);                                   // the null that caused the alert
+        Assert.Equal(observed, SectionKey.Normalize(graphId));      // …and both sides now agree
+
+        var issues = d.Evaluate(local(_localStamp), server(_serverStale), true, true, _localStamp.AddMinutes(22),
+            [new SectionSyncState(observed!, "Note / Family", _sectionSynced)]);
+        Assert.Empty(issues);
     }
 
     [Fact]

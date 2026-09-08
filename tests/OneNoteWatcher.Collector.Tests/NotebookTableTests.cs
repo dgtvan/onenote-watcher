@@ -1,6 +1,7 @@
 using OneNoteWatcher.Collector;
 using OneNoteWatcher.Core.History;
 using OneNoteWatcher.Core.Index;
+using OneNoteWatcher.Core.Rules;
 
 namespace OneNoteWatcher.Collector.Tests;
 
@@ -14,10 +15,10 @@ public class NotebookTableTests : IDisposable
 {
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "onwatch_nbtable_" + Guid.NewGuid().ToString("N"));
 
-    private EtwSyncDetector NewDetector() =>
+    private EtwSyncDetector NewDetector(IgnoreRules? ignore = null) =>
         new(new NullSource(), new SyncHistoryLog(_dir),
             new NameResolver(new SearchIndexReader(Path.Combine(_dir, "noidx")), new MruReader(Path.Combine(_dir, "nomru"))),
-            oneNoteRunning: () => true);
+            oneNoteRunning: () => true, ignore: ignore);
 
     private static OfficeLogMessage Msg(string json) =>
         new(DateTime.UtcNow, OfficeEtw.TelemetryCategory, "SendEvent " + json);
@@ -79,6 +80,43 @@ public class NotebookTableTests : IDisposable
         var failedNotebooks = snap.Notebooks.Where(n => n.LastSuccess == false).Select(n => n.Name).ToHashSet();
         var notebooksWithIssues = snap.ActiveIssues.Where(i => i.NotebookName is not null).Select(i => i.NotebookName!).ToHashSet();
         Assert.Equal(notebooksWithIssues, failedNotebooks);
+    }
+
+    [Fact]
+    public void An_issue_silenced_by_ignore_rules_does_not_fail_its_notebook()
+    {
+        // Reported 2026-09-06: [ignore] was applied only in the tray, which decides the icon, while the
+        // collector derived this table from the unfiltered issue set — so silencing an event left a
+        // green icon above a FAILED row for the same notebook.
+        var det = NewDetector(new IgnoreRules([], [], [], [], [], ["Office.OneNote.Storage.RealTime.NoteItService"]));
+        det.OnMessage(Msg(RealTimeFail("2026-09-06T08:33:19Z")));
+
+        var snap = det.Snapshot();
+        Assert.Single(snap.ActiveIssues);   // still raised, still published, still in the history
+        Assert.True(Assert.Single(snap.Notebooks).LastSuccess);
+    }
+
+    [Fact]
+    public void An_ignore_rule_for_a_DIFFERENT_event_still_fails_the_notebook()
+    {
+        var det = NewDetector(new IgnoreRules([], [], [], [], [], ["Office.OneNote.Storage.RealTime.SomethingElse"]));
+        det.OnMessage(Msg(RealTimeFail("2026-09-06T08:33:19Z")));
+
+        Assert.False(Assert.Single(det.Snapshot().Notebooks).LastSuccess);
+    }
+
+    [Fact]
+    public void The_table_never_disagrees_with_the_problem_list_under_ignore_rules()
+    {
+        var rules = new IgnoreRules([], [], [], [], [], ["Office.OneNote.Storage.RealTime.NoteItService"]);
+        var det = NewDetector(rules);
+        det.OnMessage(Msg(RealTimeFail("2026-09-06T08:33:19Z")));
+
+        var snap = det.Snapshot();
+        var failedNotebooks = snap.Notebooks.Where(n => n.LastSuccess == false).Select(n => n.Name).ToHashSet();
+        var alerting = snap.ActiveIssues.Where(i => i.NotebookName is not null && !rules.IsIgnored(i))
+            .Select(i => i.NotebookName!).ToHashSet();
+        Assert.Equal(alerting, failedNotebooks);
     }
 
     // ---- per-section results published for the cloud check ----

@@ -83,14 +83,23 @@ public static class SyncEventMapper
         var now = e.Time == default ? DateTimeOffset.Now : e.Time;
         var realtime = e.Kind == SyncEventKind.RealTimeService;
 
+        // "No TTL" means "held until a success proves it resolved" — which requires that such a success
+        // can exist. For these two kinds it cannot: SyncScope keys them by event NAME, and CoveredBy
+        // never returns an event key, so nothing in the system is able to clear one. Left without a TTL
+        // they would not be held pending proof, they would be stuck red forever. Time is their only
+        // exit, so they get it whatever the outcome — and a problem that is still happening re-arms the
+        // TTL on every occurrence, so only one that genuinely stopped fades.
+        var clearedOnlyByTime = e.Kind is SyncEventKind.UnrecognisedStorage or SyncEventKind.OtherOneNoteSignal;
+        var ttl = (DateTimeOffset?)(now + SuspectedIssueTtl);
+
         var (kind, expires) = e.Outcome switch
         {
             SyncOutcome.Failure => (
                 e.ErrorCodeHex is not null ? IssueKind.ErrorCodeReported : IssueKind.SyncFailed,
-                (DateTimeOffset?)null),
-            SyncOutcome.Transient => (IssueKind.ErrorCodeReported, (DateTimeOffset?)null),
+                clearedOnlyByTime ? ttl : null),
+            SyncOutcome.Transient => (IssueKind.ErrorCodeReported, clearedOnlyByTime ? ttl : null),
             // an unproven signal self-clears, so it cannot stay red forever without evidence
-            _ => (IssueKind.SyncFailed, now + SuspectedIssueTtl),   // SuspectedFailure / Unknown
+            _ => (IssueKind.SyncFailed, ttl),   // SuspectedFailure / Unknown
         };
 
         var (summary, recommendation) = e.Outcome switch

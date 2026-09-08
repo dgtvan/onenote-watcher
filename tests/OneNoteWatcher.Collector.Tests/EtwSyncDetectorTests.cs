@@ -148,14 +148,14 @@ public class EtwSyncDetectorTests
     {
         var (det, _, _) = NewDetector();
         var now = DateTimeOffset.UtcNow.ToString("O");
-        det.OnMessage(Msg($$"""{"EventName":"Office.OneNote.Storage.RealTime.SyncBlockerInstantiated","Time":"{{now}}"}"""));
+        det.OnMessage(Msg($$"""{"EventName":"Office.OneNote.Storage.RealTime.ContentSyncBlockerInstantiated","Time":"{{now}}"}"""));
         var issue = Assert.Single(det.Snapshot().ActiveIssues);   // visible while fresh
                 Assert.NotNull(issue.ExpiresUtc);
 
         // the same signal from an old session is already past its TTL and is swept away,
         // so an unconfirmed suspicion can never pulse forever
         var (old, _, _) = NewDetector();
-        old.OnMessage(Msg("""{"EventName":"Office.OneNote.Storage.RealTime.SyncBlockerInstantiated","Time":"2020-01-01T00:00:00Z"}"""));
+        old.OnMessage(Msg("""{"EventName":"Office.OneNote.Storage.RealTime.ContentSyncBlockerInstantiated","Time":"2020-01-01T00:00:00Z"}"""));
         Assert.Empty(old.Snapshot().ActiveIssues);
     }
 

@@ -83,7 +83,10 @@ names.Refresh(TimeSpan.Zero);
 
 var detector = new EtwSyncDetector(source, history, names, log: log,
     onStatusChanged: status => status.Save(statusPath),
-    transient: OneNoteWatcher.Core.Rules.TransientPolicy.FromConfig(ini));
+    transient: OneNoteWatcher.Core.Rules.TransientPolicy.FromConfig(ini),
+    // the collector needs these too: it derives the NOTEBOOKS table, and a notebook must not read
+    // FAILED because of an event the user has already told us to ignore
+    ignore: OneNoteWatcher.Core.Rules.IgnoreRules.FromConfig(ini));
 if (liveSource is not null) liveSource.OnEventsLost = detector.ReportEventsLost;
 
 var seeded = detector.SeedSectionSuccesses(WatcherStatus.Load(statusPath)?.Sections);
