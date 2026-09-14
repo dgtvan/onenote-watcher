@@ -73,6 +73,15 @@ public static class SyncEventJson
         ["Office.OneNote.Storage.PageSyncSession"] = "per-page timing metric",
         // Connectivity transition; handled as its own signal, not an outcome.
         ["Office.OneNote.Storage.ConnectivityChanged"] = "connectivity transition",
+        // OneNote asking its user-info service what kind of account is signed in — not a sync call, and
+        // listed HERE (above the error checks) because its error is real but is about that lookup, not
+        // about any notebook. Evidence, 2026-09-08..14, six OneNote launches: it fires once per launch,
+        // 1-2 s after the connectivity ONLINE events, always with Data.HttpStatus 503 and no notebook or
+        // section id, and every time both notebooks completed a successful sync within 6 s. Alerting on it
+        // held the tray red for the full 6 h TTL with "check Wi-Fi" advice while sync was healthy — and no
+        // success can clear an event-scoped issue. A real outage still surfaces on the Storage events.
+        ["Office.OneNote.UserInfoService.GetUserTypesRequestFailed"] =
+            "account-type lookup by OneNote's user-info service, not a sync — sync proceeds without it",
     };
 
     /// <summary>

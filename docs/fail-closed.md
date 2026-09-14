@@ -199,8 +199,28 @@ All are deliberate, evidence-backed, and recorded in the history (never silently
 |---|---|
 | `Storage.SyncScore` | OneNote's **background replication scan**. It reports items it *skipped* (e.g. a locked password-protected section) at every session start and periodic pass. It carries no notebook/section id and has no clearing event, so alerting on it is a permanent false alarm — this was a real false alert on 2026-09-06. |
 | `Storage.PageSyncSession` | Per-page timing metric. Its `ErrorState_Time*` fields *are* used — row 1 above catches a page that actually spent time in an error state. |
+| `UserInfoService.GetUserTypesRequestFailed` | OneNote asking its user-info service what **kind of account** is signed in. Its error is real, but it is about that lookup, not about any notebook. See the evidence below. |
 
 `Storage.ConnectivityChanged` is not an outcome either; it drives a dedicated offline warning.
+
+`GetUserTypesRequestFailed` sits in row 2 rather than row 5 because it always carries an error —
+`Data.HttpStatus: 503` — so a "benign unless error" listing would never have silenced it. Across
+six OneNote launches (2026-09-08 → 2026-09-14) it fired **once per launch**, 1–2 s after the
+connectivity `ONLINE` events, always with 503 and no notebook or section id — and every time both
+notebooks completed a successful sync within 6 seconds:
+
+```
+10:21:13  (network)  ONLINE
+10:21:15  Note / Quick Notes  PAGE-DOWNLOAD  OK  (1894 ms)
+10:21:15  (no location)  FAILED(transient)  HTTP 503  <…UserInfoService.GetUserTypesRequestFailed>
+10:21:21  Work  OK
+10:21:30  Note (Display name: Van)  OK
+```
+
+As an issue it was scoped `event:<name>`, which no success can cover, so it held the tray red for
+the full 6 h TTL, advising "check Wi-Fi" while sync was demonstrably healthy. A real outage
+still surfaces — on the Storage events, which carry notebook and section identity. The exemption
+is this one name; any other `UserInfoService.…Failed` is still caught.
 
 **Row 5 — no outcome to report, but a reported error still counts** (`BenignUnlessError`):
 
@@ -568,8 +588,9 @@ be settled from surrounding history lines instead.) The payload is kept only for
 ## Known noise, and how to silence it
 
 Both of the events this section used to name have since been settled by their captured payloads:
-`SyncBlockerInstantiated` is classified as the startup gate, and `GetUserTypesRequestFailed` now
-reports its real `HTTP 503` and expires after 6 h. Neither needs an ignore rule any more.
+`SyncBlockerInstantiated` is classified as the startup gate, and `GetUserTypesRequestFailed` as an
+account-type lookup that is not a sync (it first reported its real `HTTP 503` and expired after
+6 h; a week of launches then showed it never affects sync). Neither needs an ignore rule.
 
 What remains is any event still judged on its **name** alone. Fail-closed keeps those visible as
 errors that self-expire after 6 h. Once you are satisfied one is harmless:

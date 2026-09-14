@@ -66,7 +66,8 @@ public class FailClosedTests
     [Theory]
     // real events this machine emits that the previous build dropped entirely
     [InlineData("""{"EventName":"Office.OneNote.Storage.RealTime.ContentSyncBlockerInstantiated"}""")]
-    [InlineData("""{"EventName":"Office.OneNote.UserInfoService.GetUserTypesRequestFailed"}""")]
+    // a sibling of the classified GetUserTypesRequestFailed — the exemption is by name, not by service
+    [InlineData("""{"EventName":"Office.OneNote.UserInfoService.GetOtherThingRequestFailed"}""")]
     // plausible future ones
     [InlineData("""{"EventName":"Office.OneNote.Storage.UploadBlockedByPolicy"}""")]
     [InlineData("""{"EventName":"Office.OneNote.Sync.ContentStuckDetected"}""")]
@@ -273,15 +274,30 @@ public class FailClosedTests
             Parse("""{"EventName":"Office.OneNote.Storage.RealTime.SyncBlockerInstantiated","Data.Error_Code":3758096477}""").Outcome);
     }
 
+    [Fact]
+    public void The_account_type_lookup_failing_at_launch_is_not_a_sync_failure()
+    {
+        // Six launches 2026-09-08..14: once per launch, 1-2 s after ONLINE, always HTTP 503, no notebook
+        // or section id, and both notebooks synced OK within 6 s every time. As an issue it held the tray
+        // red for 6 h with "check Wi-Fi" advice. Verbatim payload, 2026-09-08 10:20:47 (token elided).
+        var e = Parse("""{"EventName": "Office.OneNote.UserInfoService.GetUserTypesRequestFailed", "Flags": 30962273224818945, "InternalSequenceNumber": 535, "Time": "2026-09-08T03:20:45Z", "AriaTenantToken": "<elided>", "Data.HttpStatus": 503}""");
+        Assert.Equal(SyncOutcome.Diagnostic, e.Outcome);
+        Assert.False(e.IsProblem);
+        Assert.Null(SyncEventMapper.ToIssue(e, "etw"));
+        // recorded, not dropped: the history still says what happened
+        Assert.Contains("HTTP 503", SyncEventMapper.ToHistoryLine(e));
+    }
+
     // ---------- an HTTP status is an outcome, and must be read as one ----------
 
     [Fact]
     public void A_failing_http_status_is_read_as_the_outcome_instead_of_being_guessed_from_the_name()
     {
-        // 2026-09-08: this arrived with Data.HttpStatus 503 and was reported as "indicates a problem,
-        // but without a definite outcome" — the definite outcome was sitting unread in the payload.
-        // verbatim from the UNCLASSIFIED PAYLOAD log line of 2026-09-08 10:20:47 (token elided)
-        var e = Parse("""{"EventName": "Office.OneNote.UserInfoService.GetUserTypesRequestFailed", "Flags": 30962273224818945, "InternalSequenceNumber": 535, "Time": "2026-09-08T03:20:45Z", "AriaTenantToken": "<elided>", "Data.HttpStatus": 503}""");
+        // 2026-09-08: GetUserTypesRequestFailed arrived with Data.HttpStatus 503 and was reported as
+        // "indicates a problem, but without a definite outcome" — the definite outcome was sitting
+        // unread in the payload. That event is now classified; its real payload shape is kept here
+        // under an unclassified name so the status reading itself stays covered.
+        var e = Parse("""{"EventName": "Office.OneNote.UserInfoService.GetOtherThingRequestFailed", "Flags": 30962273224818945, "InternalSequenceNumber": 535, "Time": "2026-09-08T03:20:45Z", "AriaTenantToken": "<elided>", "Data.HttpStatus": 503}""");
         Assert.Equal(SyncOutcome.Transient, e.Outcome);        // 5xx is the server's own "try again"
         Assert.Equal("HTTP 503", e.ErrorDescription);
 
