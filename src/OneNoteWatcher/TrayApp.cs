@@ -22,6 +22,12 @@ namespace OneNoteWatcher;
 public sealed class TrayApp : IDisposable
 {
     private readonly NotifyIcon _tray = new();
+    /// <summary>
+    /// Hidden control used only to marshal callbacks onto the UI thread. Its handle is created in the
+    /// constructor; the tray's ContextMenuStrip can't be used for this because it has no handle until
+    /// the menu is first opened, so BeginInvoke on it throws.
+    /// </summary>
+    private readonly Control _ui = new();
     private readonly System.Windows.Forms.Timer _pollTimer = new();
     private readonly System.Windows.Forms.Timer _pulseTimer = new();
     private readonly System.Windows.Forms.Timer _graphTimer = new();
@@ -55,6 +61,7 @@ public sealed class TrayApp : IDisposable
     public TrayApp(bool simulate)
     {
         _simulate = simulate;
+        _ = _ui.Handle;   // force handle creation on the UI thread so BeginInvoke works from any thread
         _configPath = Path.Combine(AppContext.BaseDirectory, "config.ini");
         IniFile ini;
         try { ini = File.Exists(_configPath) ? IniFile.Load(_configPath) : IniFile.Parse(""); }
@@ -90,7 +97,7 @@ public sealed class TrayApp : IDisposable
             {
                 if (e.Mode != Microsoft.Win32.PowerModes.Resume) return;
                 _log.Info("machine resumed from sleep — re-checking the cloud side now");
-                try { _tray.ContextMenuStrip?.BeginInvoke(() => _ = PollGraphAsync()); }
+                try { _ui.BeginInvoke(() => _ = PollGraphAsync()); }
                 catch (Exception ex) when (ex is InvalidOperationException or ObjectDisposedException) { }
             };
         }
@@ -100,7 +107,7 @@ public sealed class TrayApp : IDisposable
         {
             _log.Warn($"OAlerts dialog: {issue.Message}");
             lock (_localIssues) _localIssues[issue.DedupeKey] = issue;
-            try { _tray.ContextMenuStrip?.BeginInvoke(Refresh); } catch { }
+            try { _ui.BeginInvoke(Refresh); } catch { }
         });
         _log.Info($"OAlerts watcher: {(_oalerts.Available ? "on" : "unavailable")}");
 
@@ -139,7 +146,7 @@ public sealed class TrayApp : IDisposable
             _log.Info("Graph sign-in started");
             await _graphAuth.SignInAsync((url, code) =>
             {
-                _tray.ContextMenuStrip?.BeginInvoke(() =>
+                _ui.BeginInvoke(() =>
                 {
                     try { Clipboard.SetText(code); } catch { }
                     MessageBox.Show(
@@ -406,5 +413,6 @@ public sealed class TrayApp : IDisposable
         _log.Info("tray dispose");
         _pollTimer.Dispose(); _pulseTimer.Dispose(); _graphTimer.Dispose(); _oalerts.Dispose();
         _tray.Visible = false; _tray.Dispose();
+        _ui.Dispose();
     }
 }
