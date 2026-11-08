@@ -44,6 +44,23 @@ public static class SyncEventJson
     /// <summary>Field-name pattern for numeric error codes (Error_Code, NotebookErrorCode, SH_ErrorCode, …).</summary>
     private static readonly Regex ErrorCodeField = new(@"^Data\.[A-Za-z0-9_.]*Error_?Code$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
+    /// <summary>
+    /// Is this value shaped like a OneNote sync error code, i.e. a failure HRESULT (high bit set)?
+    ///
+    /// <see cref="ErrorCodeField"/> matches on NAME, and not every field called "…ErrorCode" carries one.
+    /// Observed 2026-11-08: <c>Office.OneNote.GetSharePointIdsForDocument</c> sends
+    /// <c>Data.ErrorCode: 2</c> — an internal enum — next to <c>Data.HttpStatusCode: 401</c>, and the
+    /// watcher rendered the enum as the sync error "0x00000002" (113 occurrences) while the 401 that
+    /// actually explained it went unused. Every real OneNote sync code observed or documented is an
+    /// 0xE0xxxxxx / 0xE4xxxxxx HRESULT, so a small integer is kept as evidence in <c>ErrorFields</c>
+    /// but never promoted to the headline code.
+    ///
+    /// Still fail-closed: a value rejected here costs the event none of its other failure signals
+    /// (error text, HTTP status, a failure word in the name, Success=false), so it is still surfaced
+    /// — just not under a code that does not exist.
+    /// </summary>
+    private static bool LooksLikeErrorHresult(uint v) => v >= 0x8000_0000u;
+
     /// <summary>An 8-digit hex code embedded in free-text error output, e.g. "(0xE000002E)".</summary>
     private static readonly Regex EmbeddedHexCode = new(@"0x([0-9A-Fa-f]{8})(?![0-9A-Fa-f])", RegexOptions.Compiled);
 
@@ -53,8 +70,36 @@ public static class SyncEventJson
     /// </summary>
     private static readonly Regex HttpStatusField = new(@"^Data\.Http(Status|StatusCode|ResponseCode)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
 
-    /// <summary>Field-name pattern for error text.</summary>
-    private static readonly Regex ErrorTextField = new(@"^Data\.(Error|Error_Description|Error_Type|OperationWithError|FailureReason|ErrorMessage)$", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+    /// <summary>
+    /// Field-name pattern for error text.
+    ///
+    /// The optional prefix matters: OneNote nests the description that names the fault, e.g.
+    /// <c>Data.ErrorState_Errors_Page_InboundError_Error_Description</c> = "ErrEndpointAccessDenied" on
+    /// a PageSyncSession, while a top-level <c>Data.Error_Description</c> is the exception rather than
+    /// the rule. Anchoring to the top level dropped exactly the word that routes an issue through
+    /// <see cref="Diagnosis.ErrorCatalog"/>, so 210 access-denied failures on 2026-11-08 reached the
+    /// user as a bare code with no category and no advice. <c>Descript</c> is not a typo — Office
+    /// truncates long field names, and one payload carried both spellings.
+    /// </summary>
+    private static readonly Regex ErrorTextField = new(
+        @"^Data\.(.*_)?(Error|Error_?Descript(ion)?|Error_?Type|OperationWithError|FailureReason|Error_?Message)$",
+        RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    /// <summary>
+    /// An opaque value, not a message: Office hashes free text that might carry PII before sending it,
+    /// so <c>Data.ErrorMessage</c> can arrive as base64 (observed 113 times on 2026-11-08:
+    /// "ohgI+BySYz4aMY1ToXtlRHLIcGWJN4MTLJWqBtcs9XA=", a 32-byte digest). Showing it to the user is
+    /// noise, and feeding it to the keyword matcher in <see cref="Diagnosis.ErrorCatalog"/> is worse
+    /// — random letters can hit a category pattern by accident. It stays in <c>ErrorFields</c> for
+    /// the technical detail; it never becomes the message.
+    ///
+    /// Deliberately narrow. OneNote's real error text is a bare CamelCase identifier
+    /// ("ErrCobaltAuthenticationFailure") which is also pure base64 alphabet, so length and charset
+    /// alone would swallow the very descriptions the parser exists to read. A digest is therefore
+    /// required to carry a character an identifier cannot: '+', '/' or base64 padding.
+    /// </summary>
+    private static readonly Regex OpaqueHash =
+        new(@"^(?=[A-Za-z0-9+/]*[+/=])[A-Za-z0-9+/]{24,}={0,2}$", RegexOptions.Compiled);
 
     /// <summary>Values in an error-text field that actually mean "fine".</summary>
     private static readonly string[] NonErrorTexts = ["", "no error", "none", "0", "success", "ok", "noerror"];
@@ -115,6 +160,14 @@ public static class SyncEventJson
         // by content moving seconds later, is the sync engine being constructed, not a sync failure.
         // A real blockage still surfaces: it would come through the Storage events that carry identity.
         ["Office.OneNote.Storage.RealTime.SyncBlockerInstantiated"] = "OneNote's startup sync gate being constructed (no payload, always followed by successful sync)",
+        // A counter emitted alongside each real-time health probe, NOT a sync outcome. Its payload —
+        // captured by the UNCLASSIFIED PAYLOAD log on 2026-11-02 and 2026-11-07 — is the entire event:
+        // {"Data.Tag":"4pfvq","Data.Service":0}. No notebook, no section, no code, no success flag, and
+        // nothing in the system can clear an event-scoped issue, so fail-closed turned it into a
+        // permanently red tray plus ~100 UNKNOWN history lines a day (188 occurrences on 2026-11-08
+        // alone), drowning the real failures it sat between. Listed HERE rather than in
+        // DiagnosticEvents so that if a build ever does attach an error to it, that error still surfaces.
+        ["Office.OneNote.Storage.SyncHealth"] = "a counter emitted with each real-time health probe, carrying no notebook, section or outcome",
     };
 
     /// <summary>Cheap ETW hot-path pre-filter: any OneNote SendEvent. (≈640 Office events/s, few are OneNote.)</summary>
@@ -192,7 +245,11 @@ public static class SyncEventJson
                 if (ErrorCodeField.IsMatch(p.Name))
                 {
                     var v = AsUInt(p.Value);
-                    if (v != 0) { if (code == 0) code = v; errorFields[p.Name] = v.ToString(); }
+                    if (v != 0)
+                    {
+                        if (code == 0 && LooksLikeErrorHresult(v)) code = v;
+                        errorFields[p.Name] = v.ToString();
+                    }
                 }
                 else if (HttpStatusField.IsMatch(p.Name))
                 {
@@ -212,7 +269,8 @@ public static class SyncEventJson
                         errorFields[p.Name] = v;
                         if (p.Name.EndsWith("Error_Type", StringComparison.OrdinalIgnoreCase)) errorType = v;
                         // OperationWithError names the failing operation; it is a qualifier, not the message
-                        else if (!p.Name.Equals("Data.OperationWithError", StringComparison.OrdinalIgnoreCase)) errorText ??= v;
+                        else if (!p.Name.Equals("Data.OperationWithError", StringComparison.OrdinalIgnoreCase)
+                                 && !OpaqueHash.IsMatch(v.Trim())) errorText ??= v;
                     }
                 }
             }
@@ -238,7 +296,17 @@ public static class SyncEventJson
             // "indicates a problem, but without a definite outcome" — while the definite outcome sat
             // unread in the payload. A failing status supplies the error text when nothing else did;
             // a 2xx/3xx is positive proof the call succeeded.
-            if (httpStatus >= 400) errorText ??= $"HTTP {httpStatus}";
+            // Name the 4xx that matter. A bare "HTTP 401" matches the catalog's NETWORK keywords
+            // ("Http"), which told a user whose sign-in had been rejected to check their Wi-Fi;
+            // "Unauthorized"/"Forbidden" reaches the permission branch, which tells them to sign in
+            // again — the actual fix.
+            if (httpStatus >= 400)
+                errorText ??= httpStatus switch
+                {
+                    401 => "HTTP 401 Unauthorized",
+                    403 => "HTTP 403 Forbidden",
+                    _ => $"HTTP {httpStatus}",
+                };
             else if (httpStatus is >= 200 and < 400) sawExplicitNoError = true;
 
             var transient = root.TryGetProperty("Data.IsErrorTransient", out var tr) && tr.ValueKind == JsonValueKind.True;

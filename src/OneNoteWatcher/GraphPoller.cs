@@ -77,6 +77,7 @@ public sealed class GraphPoller
             _log?.Info($"graph poll: {LastSnapshot.Notebooks.Count} notebooks, {LastSnapshot.Sections.Count} sections, map keys={map.Count}, baselined={_outcome.BaselinedSections}, collector sections={collectorSections?.Count ?? 0}, outcome issues={issues.Count}");
             foreach (var i in issues) _log?.Warn($"outcome issue {i.Location}: {i.Message}");
             foreach (var a in _outcome.LastAbandoned) _log?.Info($"cloud check gave up on {a}");
+            foreach (var r in _outcome.LastResolved) _log?.Info($"cloud check resolved {r}");
             return issues;
         }
         catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or InvalidOperationException)

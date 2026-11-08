@@ -60,14 +60,35 @@ public sealed record WatcherStatus
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
     }
 
+    /// <summary>
+    /// Read the published status, retrying briefly over the window in which <see cref="Save"/> replaces
+    /// the file.
+    ///
+    /// Save writes a .tmp and moves it over this path, so for a few milliseconds every few seconds the
+    /// path is mid-replace and an open fails. The tray polls far more often than that, so it loses the
+    /// race regularly — and a null here is not a harmless miss: the caller drops EVERY issue the
+    /// collector published and raises "the collector is not running — it has never reported" instead.
+    /// Caught in the act on 2026-11-09 at 00:10:51, where the tray went 18 problems → 2 → 16 over six
+    /// seconds while the collector was writing normally the whole time.
+    ///
+    /// Retries cover the replace window only; a genuinely absent, unreadable or corrupt file still
+    /// returns null after them, so a collector that really has stopped is still reported.
+    /// </summary>
     public static WatcherStatus? Load(string path)
     {
-        try
+        for (var attempt = 0; ; attempt++)
         {
-            if (!File.Exists(path)) return null;
-            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
-            return JsonSerializer.Deserialize<WatcherStatus>(fs, Json);
+            try
+            {
+                if (!File.Exists(path)) return null;
+                using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+                return JsonSerializer.Deserialize<WatcherStatus>(fs, Json);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
+            {
+                if (attempt >= 4) return null;
+                Thread.Sleep(20 * (attempt + 1));
+            }
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { return null; }
     }
 }

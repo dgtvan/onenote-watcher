@@ -53,6 +53,13 @@ public sealed class OutcomeDetector
     /// <summary>Sections abandoned during the last <c>Evaluate</c>, with the reason — for the log.</summary>
     public IReadOnlyList<string> LastAbandoned { get; private set; } = [];
 
+    /// <summary>
+    /// Sections that WERE flagged as not reaching OneDrive and no longer are, cleared during the last
+    /// <c>Evaluate</c> — for the log, so a finding that goes away leaves a trace instead of silently
+    /// vanishing from the tray.
+    /// </summary>
+    public IReadOnlyList<string> LastResolved { get; private set; } = [];
+
     public int BaselinedSections => _baseline.Count;
 
     public static IReadOnlyList<LocalSection> LocalSectionsFrom(SearchIndexReader index) =>
@@ -73,6 +80,18 @@ public sealed class OutcomeDetector
         var at = now ?? DateTimeOffset.UtcNow;
         var issues = new List<SyncIssue>();
         var abandoned = new List<string>();
+        var resolved = new List<string>();
+
+        // Drop the "local has been ahead since …" clock for a section that is no longer ahead. Every
+        // path below that leaves the ahead state must come through here, because a leftover entry is
+        // not inert: the grace period is measured from it, so the NEXT time that section's timestamp
+        // moves the alert fires instantly instead of after the configured wait. Observed 2026-11-08:
+        // Note/Videos kept AheadSince=16:23Z for hours after its finding disappeared from the window.
+        void NoLongerAhead(string k)
+        {
+            if (!_aheadSince.Remove(k, out var since)) return;
+            if (at - since >= _grace) resolved.Add($"{k}: reached OneDrive after {Human(at - since)}");
+        }
 
         foreach (var gs in server.Sections)
         {
@@ -118,7 +137,7 @@ public sealed class OutcomeDetector
 
             if (localMoved && (serverCaughtUp || serverMoved || collectorSynced))
             {
-                _baseline[key] = (localNewest, serverNewest); _aheadSince.Remove(key);   // synced
+                _baseline[key] = (localNewest, serverNewest); NoLongerAhead(key);   // synced
                 continue;
             }
             if (localMoved && !serverCaughtUp && !collectorSynced)
@@ -142,7 +161,7 @@ public sealed class OutcomeDetector
                     && collectorSections is not null && oneNoteRunning && at - since >= _unconfirmedTtl)
                 {
                     _baseline[key] = (localNewest, serverNewest);
-                    _aheadSince.Remove(key);
+                    _aheadSince.Remove(key);   // abandoned, not resolved — reported as its own line
                     abandoned.Add($"{gs.NotebookName} / {gs.DisplayName}: no corroboration after " +
                                   $"{Human(at - since)} with OneNote running and the collector reporting — " +
                                   "treating the local timestamp as a sync re-stamp, not an unsent change");
@@ -169,6 +188,7 @@ public sealed class OutcomeDetector
                 && !SectionSyncedAt(collectorSections, gs.Id, serverNewest))
             {
                 _baseline[key] = (localNewest, serverNewest);
+                NoLongerAhead(key);
                 issues.Add(new SyncIssue
                 {
                     Detector = DetectorName, Kind = IssueKind.DownloadStuck,
@@ -183,9 +203,16 @@ public sealed class OutcomeDetector
                 });
                 continue;
             }
-            if (!localMoved) _baseline[key] = (b.local, serverNewest); // keep server side current
+            if (!localMoved)
+            {
+                _baseline[key] = (b.local, serverNewest); // keep server side current
+                // The local timestamp fell back to the baseline, so whatever made it look ahead is gone
+                // (OneNote re-reads and re-stamps the index). Nothing is pending for this section.
+                NoLongerAhead(key);
+            }
         }
         LastAbandoned = abandoned;
+        LastResolved = resolved;
         return issues;
     }
 

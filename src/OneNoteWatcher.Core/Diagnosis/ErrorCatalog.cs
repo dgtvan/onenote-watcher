@@ -40,6 +40,33 @@ public static class ErrorCatalog
 {
     private static readonly Dictionary<uint, ErrorExplanation> ByCode = new()
     {
+        [0xE0000024] = new(FailureCategory.Permission,
+            "OneNote's sign-in was rejected, so it cannot sync this notebook.",
+            "In OneNote open File → Account, sign out and sign back in with the account that owns the " +
+            "notebook, then press Shift+F9. If it returns, check that Windows and OneNote are signed in " +
+            "as the SAME account — a work account on the PC with a personal notebook open is the usual cause.",
+            Reference: ErrorExplanation.MicrosoftFixArticle),
+
+        [0xE0000057] = new(FailureCategory.Conflict,
+            "This page cannot upload until another part of the section finishes uploading " +
+            "(ErrCannotOutboundUntilSomeOtherGraphSpacesHave).",
+            "A symptom, not a cause: fix whatever is blocking that section — almost always an error " +
+            "reported against the same notebook moments earlier — and this clears on the next sync.",
+            LikelyTransient: true),
+
+        [0xE000006E] = new(FailureCategory.Permission,
+            "OneNote was refused access to the sync endpoint (ErrEndpointAccessDenied).",
+            "Usually the sign-in, not the notebook: open File → Account in OneNote, sign out and back " +
+            "in, then Shift+F9. If only one notebook is affected, confirm you still have access to it in " +
+            "OneDrive; for a shared notebook ask the owner to re-share it.",
+            Reference: ErrorExplanation.MicrosoftFixArticle),
+
+        [0xE000006F] = new(FailureCategory.Permission,
+            "The server rejected OneNote's credentials for the file-sync protocol (ErrCobaltAuthenticationFailure).",
+            "Sign out and back in from File → Account in OneNote. If that does not take, sign out of " +
+            "OneDrive too and back in, so both hold a fresh token.",
+            Reference: ErrorExplanation.MicrosoftFixArticle),
+
         [0xE000002E] = new(FailureCategory.Conflict,
             "The notebook or section is out of sync with the copy in OneDrive.",
             "In OneNote press Shift+F9 (Sync This Notebook Now). If it keeps failing, close the notebook " +
